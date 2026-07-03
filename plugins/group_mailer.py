@@ -41,50 +41,92 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 # In-memory cache for userbot groups
 userbot_groups_cache = {}
 
-def get_mailer_status():
-    selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
-    selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
-    msg_data = json.loads(get_setting("gm_message") or "{}")
-    interval = int(get_setting("gm_repeat_interval") or "0")
-    links_map = json.loads(get_setting("gm_group_links_map") or "{}")
-    update_group = get_setting("gm_update_group_id")
-    
-    ub_status = f"🔴 None"
-    if selected_ubs:
-        connected_count = 0
-        for ub_id in selected_ubs:
-            client = userbot_fleet_manager.get_client(int(ub_id))
-            if client and client.is_connected():
-                connected_count += 1
-        ub_status = f"🟢 Configured ({connected_count}/{len(selected_ubs)} Connected)"
-        
-    msg_status = "🔴 None"
-    if msg_data:
-        msg_status = f"🟢 Configured ({msg_data.get('type').upper()})"
-        
-    rep_status = "🔴 Off (Manual Only)"
-    if interval > 0:
-        if interval < 60:
-            rep_status = f"🟢 Every {interval} minutes"
-        else:
-            rep_status = f"🟢 Every {interval // 60} hour(s)"
+# Initialize database schema for task-based mailer
+def init_plugin_db():
+    try:
+        with main_module.db_conn() as conn:
+            c = conn.cursor()
+            is_pg = main_module.USING_POSTGRES
+            auto_inc = "SERIAL PRIMARY KEY" if is_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
             
-    last_run_time = "Never"
-    last_run_timestamp = float(get_setting("gm_last_run") or "0")
-    if last_run_timestamp > 0:
-        last_run_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_run_timestamp))
-        
-    update_group_status = f"`{update_group}`" if update_group else "🔴 Muted (No log updates)"
-        
-    return (
-        f"👤 *Selected Userbots:* {ub_status}\n"
-        f"👥 *Groups Selected:* `{len(selected_groups)}` groups marked\n"
-        f"🔗 *Mapped Join Links:* `{len(links_map)}` links stored\n"
-        f"📢 *Update Group:* {update_group_status}\n"
-        f"💬 *Mailer Message:* {msg_status}\n"
-        f"⏰ *Repeat Interval:* `{rep_status}`\n"
-        f"📅 *Last Run:* `{last_run_time}`"
-    )
+            c.execute(f"""
+                CREATE TABLE IF NOT EXISTS gm_tasks (
+                    id {auto_inc},
+                    name TEXT,
+                    userbot_ids TEXT,
+                    group_ids TEXT,
+                    message TEXT,
+                    repeat_interval INTEGER DEFAULT 0,
+                    last_run REAL DEFAULT 0,
+                    update_group_id TEXT
+                )
+            """)
+            
+            # Map join links schema inside plugin db
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS gm_links_map (
+                    group_id TEXT PRIMARY KEY,
+                    link TEXT
+                )
+            """)
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to initialize Group Mailer Task database: {e}")
+
+# Run DB initialization
+init_plugin_db()
+
+# DB Helpers for Tasks
+def db_create_task(name):
+    with main_module.db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO gm_tasks (name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, "[]", "[]", "{}", 0, 0.0, "")
+        ) if not main_module.USING_POSTGRES else c.execute(
+            "INSERT INTO gm_tasks (name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (name, "[]", "[]", "{}", 0, 0.0, "")
+        )
+        conn.commit()
+        return c.lastrowid
+
+def db_get_tasks():
+    with main_module.db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name, repeat_interval, last_run FROM gm_tasks ORDER BY id DESC")
+        return c.fetchall()
+
+def db_get_task(task_id):
+    with main_module.db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id FROM gm_tasks WHERE id = ?", (task_id,)) if not main_module.USING_POSTGRES else c.execute("SELECT id, name, userbot_ids, group_ids, message, repeat_interval, last_run, update_group_id FROM gm_tasks WHERE id = %s", (task_id,))
+        return c.fetchone()
+
+def db_update_task(task_id, field, value):
+    with main_module.db_conn() as conn:
+        c = conn.cursor()
+        query = f"UPDATE gm_tasks SET {field} = ? WHERE id = ?" if not main_module.USING_POSTGRES else f"UPDATE gm_tasks SET {field} = %s WHERE id = %s"
+        c.execute(query, (value, task_id))
+        conn.commit()
+
+def db_delete_task(task_id):
+    with main_module.db_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM gm_tasks WHERE id = ?", (task_id,)) if not main_module.USING_POSTGRES else c.execute("DELETE FROM gm_tasks WHERE id = %s", (task_id,))
+        conn.commit()
+
+# DB Helpers for Join Links
+def db_save_link(group_id, link):
+    with main_module.db_conn() as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO gm_links_map (group_id, link) VALUES (?, ?)", (str(group_id), link)) if not main_module.USING_POSTGRES else c.execute("INSERT INTO gm_links_map (group_id, link) VALUES (%s, %s) ON CONFLICT (group_id) DO UPDATE SET link = EXCLUDED.link", (str(group_id), link))
+        conn.commit()
+
+def db_get_links_map():
+    with main_module.db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT group_id, link FROM gm_links_map")
+        return dict(c.fetchall())
 
 # Translate Telethon exceptions to user-friendly reasons
 def get_friendly_error(exception):
@@ -135,7 +177,7 @@ original_get_dashboard_markup = get_dashboard_markup
 
 def new_get_dashboard_markup():
     markup = original_get_dashboard_markup()
-    markup.add(InlineKeyboardButton("📬 Group Mailer", callback_data="group_mailer_main"))
+    markup.add(InlineKeyboardButton("📬 Group Mailer Tasks", callback_data="gm_tasks_main"))
     return markup
 
 # Monkeypatch the dashboard markup function
@@ -153,17 +195,61 @@ async def fetch_dialogs_async(client, ub_id):
             })
     userbot_groups_cache[ub_id] = groups
 
-# Helper to render the interactive groups page
-def show_groups_page(chat_id, message_id, ub_id, page=0):
+# Render task control status description
+def get_task_status_text(task):
+    t_id, name, userbot_ids_raw, group_ids_raw, message_raw, interval, last_run_timestamp, update_group = task
+    selected_ubs = json.loads(userbot_ids_raw or "[]")
+    selected_groups = json.loads(group_ids_raw or "[]")
+    msg_data = json.loads(message_raw or "{}")
+    
+    ub_status = f"🔴 None"
+    if selected_ubs:
+        connected_count = 0
+        for ub_id in selected_ubs:
+            client = userbot_fleet_manager.get_client(int(ub_id))
+            if client and client.is_connected():
+                connected_count += 1
+        ub_status = f"🟢 Configured ({connected_count}/{len(selected_ubs)} Connected)"
+        
+    msg_status = "🔴 None"
+    if msg_data:
+        msg_status = f"🟢 Configured ({msg_data.get('type').upper()})"
+        
+    rep_status = "🔴 Off (Manual Only)"
+    if interval > 0:
+        if interval < 60:
+            rep_status = f"🟢 Every {interval} minutes"
+        else:
+            rep_status = f"🟢 Every {interval // 60} hour(s)"
+            
+    last_run_time = "Never"
+    if last_run_timestamp > 0:
+        last_run_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_run_timestamp))
+        
+    update_group_status = f"`{update_group}`" if update_group else "🔴 Muted (No log updates)"
+        
+    return (
+        f"📋 *Task Name:* `{name}` (ID: `{t_id}`)\n"
+        f"👤 *Selected Userbots:* {ub_status}\n"
+        f"👥 *Groups Selected:* `{len(selected_groups)}` groups marked\n"
+        f"📢 *Update Group:* {update_group_status}\n"
+        f"💬 *Mailer Message:* {msg_status}\n"
+        f"⏰ *Repeat Interval:* `{rep_status}`\n"
+        f"📅 *Last Run:* `{last_run_time}`"
+    )
+
+# Helper to render the interactive groups checklist page for a specific task
+def show_task_groups_page(chat_id, message_id, task_id, ub_id, page=0):
     groups = userbot_groups_cache.get(ub_id, [])
-    selected_ids = set(json.loads(get_setting("gm_selected_group_ids") or "[]"))
-    update_group_id = get_setting("gm_update_group_id")
+    task = db_get_task(task_id)
+    selected_ids = set(json.loads(task[3] or "[]"))
+    update_group_id = task[7]
     
     if not groups:
         markup = InlineKeyboardMarkup()
         markup.add(
-            InlineKeyboardButton("🔄 Refresh List", callback_data=f"gm_refresh_{page}"),
-            InlineKeyboardButton("🔙 Back", callback_data="group_mailer_main")
+            InlineKeyboardButton("🔄 Refresh List", callback_data=f"gm_tref_{task_id}_{page}"),
+            InlineKeyboardButton("🔙 Back", callback_data=f"gm_task_view_{task_id}")
         )
         bot.edit_message_text(
             chat_id=chat_id,
@@ -187,32 +273,32 @@ def show_groups_page(chat_id, message_id, ub_id, page=0):
         is_selected = g["id"] in selected_ids
         checkbox = "✅" if is_selected else "⬜"
         title = g["title"][:25]
-        markup.add(InlineKeyboardButton(f"{checkbox} {title}", callback_data=f"gm_tgl_{g['id']}_{page}"))
+        markup.add(InlineKeyboardButton(f"{checkbox} {title}", callback_data=f"gm_ttg_{task_id}_{g['id']}_{page}"))
         
     # Navigation row
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"gm_page_{page-1}"))
+        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"gm_tpage_{task_id}_{page-1}"))
     nav_row.append(InlineKeyboardButton(f"Page {page+1}/{total_pages}", callback_data="gm_noop"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"gm_page_{page+1}"))
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"gm_tpage_{task_id}_{page+1}"))
     markup.row(*nav_row)
     
     # Bulk actions and Refresh row
     markup.row(
-        InlineKeyboardButton("Select All", callback_data=f"gm_all_sel_{page}"),
-        InlineKeyboardButton("Clear All", callback_data=f"gm_all_clr_{page}"),
-        InlineKeyboardButton("🔄 Refresh", callback_data=f"gm_refresh_{page}")
+        InlineKeyboardButton("Select All", callback_data=f"gm_tselall_{task_id}_{page}"),
+        InlineKeyboardButton("Clear All", callback_data=f"gm_tclrall_{task_id}_{page}"),
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"gm_tref_{task_id}_{page}")
     )
 
     # Log/Update group configuration row
     log_group_btn_text = f"📢 Group: {update_group_id}" if update_group_id else "📢 Set Update Group"
     markup.row(
-        InlineKeyboardButton(log_group_btn_text, callback_data=f"gm_set_loggrp_{page}"),
-        InlineKeyboardButton("❌ Remove Group", callback_data=f"gm_clear_loggrp_{page}")
+        InlineKeyboardButton(log_group_btn_text, callback_data=f"gm_tsetgrp_{task_id}_{page}"),
+        InlineKeyboardButton("❌ Remove Group", callback_data=f"gm_tdelgrp_{task_id}_{page}")
     )
     
-    markup.add(InlineKeyboardButton("🔙 Back to Mailer Console", callback_data="group_mailer_main"))
+    markup.add(InlineKeyboardButton("🔙 Back to Task Panel", callback_data=f"gm_task_view_{task_id}"))
     
     bot.edit_message_text(
         chat_id=chat_id,
@@ -223,8 +309,8 @@ def show_groups_page(chat_id, message_id, ub_id, page=0):
     )
 
 # Register callback query handler
-@bot.callback_query_handler(func=lambda call: call.data == "group_mailer_main" or call.data.startswith("gm_"))
-def handle_group_mailer_callbacks(call):
+@bot.callback_query_handler(func=lambda call: call.data.startswith("gm_task"))
+def handle_tasks_callbacks(call):
     uid = call.from_user.id
     if not is_authorized_manager(uid):
         return
@@ -232,58 +318,94 @@ def handle_group_mailer_callbacks(call):
     data = call.data
     chat_id = call.message.chat.id
     message_id = call.message.message_id
-    selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
 
-    if data == "group_mailer_main":
-        interval = int(get_setting("gm_repeat_interval") or "0")
-        if interval == 0:
-            rep_btn_text = "⏰ Repeat: Off"
-        elif interval < 60:
-            rep_btn_text = f"⏰ Repeat: {interval}m"
-        else:
-            rep_btn_text = f"⏰ Repeat: {interval // 60}h"
+    if data == "gm_tasks_main":
+        markup = InlineKeyboardMarkup()
+        markup.row(
+            InlineKeyboardButton("📋 List Tasks", callback_data="gm_tasks_list"),
+            InlineKeyboardButton("➕ Create Task", callback_data="gm_tasks_create")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="📬 *GROUP MAILER TASKS MANAGER*\n\nDefine separate message campaigns (tasks) with different userbots, target groups, and intervals.",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+    elif data == "gm_tasks_create":
+        admin_states[uid] = "awaiting_gm_task_name"
+        bot.send_message(chat_id, "📋 *CREATE CAMPAIGN TASK*\n\nPlease enter a name for your campaign task (e.g. `Promo Group A`):")
+        bot.answer_callback_query(call.id)
+
+    elif data == "gm_tasks_list":
+        tasks = db_get_tasks()
+        markup = InlineKeyboardMarkup()
+        
+        if not tasks:
+            markup.add(InlineKeyboardButton("➕ Create Task", callback_data="gm_tasks_create"))
+            markup.add(InlineKeyboardButton("🔙 Back", callback_data="gm_tasks_main"))
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="📋 *Group Mailer Tasks:* No tasks defined yet.", reply_markup=markup, parse_mode="Markdown")
+            return
+
+        for t_id, name, interval, last_run in tasks:
+            rep_lbl = "Manual" if interval == 0 else (f"{interval}m" if interval < 60 else f"{interval//60}h")
+            markup.add(InlineKeyboardButton(f"📋 {name} ({rep_lbl})", callback_data=f"gm_task_view_{t_id}"))
+
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="gm_tasks_main"))
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="📋 *Group Mailer Tasks:* Select a task to configure/run:", reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("gm_task_view_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        if not task:
+            bot.answer_callback_query(call.id, "❌ Task not found!")
+            return
+
+        # Save active chat ID for scheduler updates
+        set_setting("gm_admin_chat_id", str(chat_id))
 
         markup = InlineKeyboardMarkup()
         
         # Row 1: Select Userbots, Select Msg
         markup.row(
-            InlineKeyboardButton("👤 Select Userbots", callback_data="gm_select_userbot"),
-            InlineKeyboardButton("💬 Select Msg", callback_data="gm_select_msg")
+            InlineKeyboardButton("👤 Select Userbots", callback_data=f"gm_taskubs_{t_id}"),
+            InlineKeyboardButton("💬 Select Msg", callback_data=f"gm_taskmsg_{t_id}")
         )
         
-        # Row 2: Groups, Repeat Interval
+        # Row 2: Groups Selector, Repeat Interval
         markup.row(
-            InlineKeyboardButton("👥 Groups", callback_data="gm_groups_list"),
-            InlineKeyboardButton(rep_btn_text, callback_data="gm_repeat_menu")
+            InlineKeyboardButton("👥 Groups", callback_data=f"gm_taskgrps_{t_id}"),
+            InlineKeyboardButton("⏰ Repeat Interval", callback_data=f"gm_taskrep_{t_id}")
         )
         
-        # Row 3: Import Join Links, Start Operation
+        # Row 3: Import Links, Start Operation
         markup.row(
-            InlineKeyboardButton("🔗 Import Join Links", callback_data="gm_import_links"),
-            InlineKeyboardButton("🚀 Start Operation", callback_data="gm_start_op")
+            InlineKeyboardButton("🔗 Import Join Links", callback_data=f"gm_tasklinks_{t_id}"),
+            InlineKeyboardButton("🚀 Start Operation", callback_data=f"gm_taskstart_{t_id}")
         )
         
-        # Row 4: Back to Dashboard
+        # Row 4: Delete Task, Back to list
         markup.row(
-            InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main")
+            InlineKeyboardButton("🗑 Delete Task", callback_data=f"gm_taskdel_{t_id}"),
+            InlineKeyboardButton("🔙 Back to Tasks", callback_data="gm_tasks_list")
         )
 
-        status_text = get_mailer_status()
-        text = (
-            "📬 *GROUP MAILER CONSOLE*\n\n"
-            f"{status_text}\n\n"
-            "Use the options below to configure and execute your broadcast operation."
-        )
-        
+        status_desc = get_task_status_text(task)
         bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text=text,
+            text=f"📬 *TASK CONTROL PANEL*\n\n{status_desc}",
             reply_markup=markup,
             parse_mode="Markdown"
         )
 
-    elif data == "gm_select_userbot":
+    elif data.startswith("gm_taskubs_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        
         clients = userbot_fleet_manager.get_all_clients()
         connected_clients = [c for c in clients if c.is_connected()]
         
@@ -300,29 +422,49 @@ def handle_group_mailer_callbacks(call):
             first_name = client._me.first_name if hasattr(client, '_me') and client._me else "Userbot"
             username = f"@{client._me.username}" if hasattr(client, '_me') and client._me and client._me.username else ""
             
-            markup.add(InlineKeyboardButton(f"{checkbox} {first_name} {username}", callback_data=f"gm_tglub_{c_id}"))
+            markup.add(InlineKeyboardButton(f"{checkbox} {first_name} {username}", callback_data=f"gm_tasktglub_{t_id}_{c_id}"))
         
-        markup.add(InlineKeyboardButton("🔙 Done / Back", callback_data="group_mailer_main"))
+        markup.add(InlineKeyboardButton("🔙 Done / Back", callback_data=f"gm_task_view_{t_id}"))
         bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text="👤 *Select Userbots to use for broadcast (Multiple selection enabled):*",
+            text=f"👤 *Select Userbots for task `{task[1]}` (Multiple selection enabled):*",
             reply_markup=markup,
             parse_mode="Markdown"
         )
 
-    elif data.startswith("gm_tglub_"):
-        ub_id = int(data.split("_")[-1])
+    elif data.startswith("gm_tasktglub_"):
+        parts = data.split("_")
+        t_id = int(parts[2])
+        ub_id = int(parts[3])
+        
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        
         if ub_id in selected_ubs:
             selected_ubs.remove(ub_id)
         else:
             selected_ubs.append(ub_id)
             
-        set_setting("gm_selected_userbots", json.dumps(selected_ubs))
+        db_update_task(t_id, "userbot_ids", json.dumps(selected_ubs))
         bot.answer_callback_query(call.id, "Preference updated!")
-        handle_group_mailer_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': 'gm_select_userbot', 'message': call.message, 'id': call.id})())
+        handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_taskubs_{t_id}", 'message': call.message, 'id': call.id})())
 
-    elif data == "gm_groups_list":
+    elif data.startswith("gm_taskmsg_"):
+        t_id = int(data.split("_")[-1])
+        admin_states[uid] = f"awaiting_gm_taskmsg_{t_id}"
+        bot.send_message(
+            chat_id,
+            "💬 *SET TASK MAILER MESSAGE*\n\n"
+            "Please send or forward the message you want to broadcast for this campaign (can be text, photo, video, or document with captions)."
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data.startswith("gm_taskgrps_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        
         if not selected_ubs:
             bot.answer_callback_query(call.id, "⚠️ Please select at least one Userbot first!", show_alert=True)
             return
@@ -335,7 +477,7 @@ def handle_group_mailer_callbacks(call):
 
         bot.answer_callback_query(call.id, "⏳ Loading groups...")
         if primary_ub in userbot_groups_cache:
-            show_groups_page(chat_id, message_id, primary_ub, page=0)
+            show_task_groups_page(chat_id, message_id, t_id, primary_ub, page=0)
         else:
             bot.edit_message_text(
                 chat_id=chat_id,
@@ -344,18 +486,169 @@ def handle_group_mailer_callbacks(call):
                 parse_mode="Markdown"
             )
             def on_fetch_done(fut):
-                show_groups_page(chat_id, message_id, primary_ub, page=0)
+                show_task_groups_page(chat_id, message_id, t_id, primary_ub, page=0)
             
             future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, primary_ub), loop)
             future.add_done_callback(on_fetch_done)
 
-    elif data.startswith("gm_refresh_"):
-        page = int(data.split("_")[-1])
+    elif data.startswith("gm_tasklinks_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
         if not selected_ubs:
-            bot.answer_callback_query(call.id, "❌ Userbot is not selected!")
+            bot.answer_callback_query(call.id, "❌ Please select at least one Userbot first!", show_alert=True)
             return
             
+        admin_states[uid] = f"awaiting_gm_tasklinks_{t_id}"
+        bot.send_message(
+            chat_id,
+            "🔗 *IMPORT TASK GROUP JOIN LINKS*\n\n"
+            "Please send your group links (invite links or usernames, one per line).\n"
+            "Example:\n`t.me/+invitehash`\n`@my_group`"
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data.startswith("gm_taskrep_"):
+        t_id = int(data.split("_")[-1])
+        markup = InlineKeyboardMarkup()
+        markup.row(
+            InlineKeyboardButton("❌ Off (Manual)", callback_data=f"gm_tasksetrep_{t_id}_0"),
+            InlineKeyboardButton("30 Min", callback_data=f"gm_tasksetrep_{t_id}_30")
+        )
+        markup.row(
+            InlineKeyboardButton("1 Hour", callback_data=f"gm_tasksetrep_{t_id}_60"),
+            InlineKeyboardButton("2 Hours", callback_data=f"gm_tasksetrep_{t_id}_120")
+        )
+        markup.row(
+            InlineKeyboardButton("6 Hours", callback_data=f"gm_tasksetrep_{t_id}_360"),
+            InlineKeyboardButton("12 Hours", callback_data=f"gm_tasksetrep_{t_id}_720")
+        )
+        markup.row(
+            InlineKeyboardButton("24 Hours", callback_data=f"gm_tasksetrep_{t_id}_1440")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"gm_task_view_{t_id}"))
+        
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="⏰ *SELECT REPEAT INTERVAL*\nConfigure how often this campaign task should automatically broadcast:",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("gm_tasksetrep_"):
+        parts = data.split("_")
+        t_id = int(parts[2])
+        minutes = int(parts[3])
+        
+        db_update_task(t_id, "repeat_interval", minutes)
+        bot.answer_callback_query(call.id, "✅ Repeat interval updated!")
+        handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': f"gm_task_view_{t_id}", 'message': call.message, 'id': call.id})())
+
+    elif data.startswith("gm_taskdel_"):
+        t_id = int(data.split("_")[-1])
+        db_delete_task(t_id)
+        bot.answer_callback_query(call.id, "🗑 Task deleted successfully!")
+        handle_tasks_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': "gm_tasks_list", 'message': call.message, 'id': call.id})())
+
+    elif data.startswith("gm_taskstart_"):
+        t_id = int(data.split("_")[-1])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        selected_groups = json.loads(task[3] or "[]")
+        msg_data = json.loads(task[4] or "{}")
+
+        if not selected_ubs:
+            bot.answer_callback_query(call.id, "❌ Please select at least one Userbot first!", show_alert=True)
+            return
+        if not selected_groups:
+            bot.answer_callback_query(call.id, "❌ Please select target groups first!", show_alert=True)
+            return
+        if not msg_data:
+            bot.answer_callback_query(call.id, "❌ Please set the mailer message first!", show_alert=True)
+            return
+
+        bot.answer_callback_query(call.id, "🚀 Starting campaign operation...")
+        asyncio.run_coroutine_threadsafe(
+            run_task_broadcast(t_id),
+            loop
+        )
+
+# Catch-all sub-handlers for page navigations and toggles on tasks
+@bot.callback_query_handler(func=lambda call: call.data.startswith("gm_t"))
+def handle_task_checklist_callbacks(call):
+    uid = call.from_user.id
+    if not is_authorized_manager(uid):
+        return
+
+    data = call.data
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    parts = data.split("_")
+
+    # gm_ttg_{task_id}_{group_id}_{page}
+    if data.startswith("gm_ttg_"):
+        t_id = int(parts[2])
+        g_id = int(parts[3])
+        page = int(parts[4])
+        
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        selected_ids = json.loads(task[3] or "[]")
+        
+        if g_id in selected_ids:
+            selected_ids.remove(g_id)
+        else:
+            selected_ids.append(g_id)
+            
+        db_update_task(t_id, "group_ids", json.dumps(selected_ids))
+        show_task_groups_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
+        bot.answer_callback_query(call.id)
+
+    # gm_tpage_{task_id}_{page}
+    elif data.startswith("gm_tpage_"):
+        t_id = int(parts[2])
+        page = int(parts[3])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        show_task_groups_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
+        bot.answer_callback_query(call.id)
+
+    # gm_tselall_{task_id}_{page}
+    elif data.startswith("gm_tselall_"):
+        t_id = int(parts[2])
+        page = int(parts[3])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
         primary_ub = str(selected_ubs[0])
+        groups = userbot_groups_cache.get(primary_ub, [])
+        
+        selected_ids = set(json.loads(task[3] or "[]"))
+        for g in groups:
+            selected_ids.add(g["id"])
+            
+        db_update_task(t_id, "group_ids", json.dumps(list(selected_ids)))
+        show_task_groups_page(chat_id, message_id, t_id, primary_ub, page)
+        bot.answer_callback_query(call.id, "✅ Selected all groups!")
+
+    # gm_tclrall_{task_id}_{page}
+    elif data.startswith("gm_tclrall_"):
+        t_id = int(parts[2])
+        page = int(parts[3])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        db_update_task(t_id, "group_ids", "[]")
+        show_task_groups_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
+        bot.answer_callback_query(call.id, "🗑 Cleared selections!")
+
+    # gm_tref_{task_id}_{page}
+    elif data.startswith("gm_tref_"):
+        t_id = int(parts[2])
+        page = int(parts[3])
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        primary_ub = str(selected_ubs[0])
+        
         client = userbot_fleet_manager.get_client(int(primary_ub))
         if not client or not client.is_connected():
             bot.answer_callback_query(call.id, "❌ Selected userbot is offline!", show_alert=True)
@@ -373,156 +666,62 @@ def handle_group_mailer_callbacks(call):
             del userbot_groups_cache[primary_ub]
             
         def on_sync_done(fut):
-            show_groups_page(chat_id, message_id, primary_ub, page)
+            show_task_groups_page(chat_id, message_id, t_id, primary_ub, page)
             
         future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, primary_ub), loop)
         future.add_done_callback(on_sync_done)
 
-    elif data.startswith("gm_page_"):
-        page = int(data.split("_")[-1])
-        primary_ub = str(selected_ubs[0])
-        show_groups_page(chat_id, message_id, primary_ub, page)
+    # gm_tsetgrp_{task_id}_{page}
+    elif data.startswith("gm_tsetgrp_"):
+        t_id = int(parts[2])
+        admin_states[uid] = f"awaiting_gm_tasklog_{t_id}"
+        bot.send_message(
+            chat_id,
+            "📢 *SET UPDATE/LOG GROUP FOR THIS TASK*\n\n"
+            "Please send the Group Chat ID (e.g. `-1001234567890`) where updates and failure logs for this campaign should go."
+        )
         bot.answer_callback_query(call.id)
 
-    elif data.startswith("gm_tgl_"):
-        parts = data.split("_")
-        g_id = int(parts[2])
+    # gm_tdelgrp_{task_id}_{page}
+    elif data.startswith("gm_tdelgrp_"):
+        t_id = int(parts[2])
         page = int(parts[3])
-        
-        selected_ids = json.loads(get_setting("gm_selected_group_ids") or "[]")
-        if g_id in selected_ids:
-            selected_ids.remove(g_id)
-        else:
-            selected_ids.append(g_id)
-            
-        set_setting("gm_selected_group_ids", json.dumps(selected_ids))
-        primary_ub = str(selected_ubs[0])
-        show_groups_page(chat_id, message_id, primary_ub, page)
-        bot.answer_callback_query(call.id)
+        db_update_task(t_id, "update_group_id", "")
+        bot.answer_callback_query(call.id, "❌ Log group removed!")
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        show_task_groups_page(chat_id, message_id, t_id, str(selected_ubs[0]), page)
 
-    elif data.startswith("gm_all_sel_"):
-        page = int(data.split("_")[-1])
-        primary_ub = str(selected_ubs[0])
-        groups = userbot_groups_cache.get(primary_ub, [])
-        selected_ids = set(json.loads(get_setting("gm_selected_group_ids") or "[]"))
-        
-        for g in groups:
-            selected_ids.add(g["id"])
-            
-        set_setting("gm_selected_group_ids", json.dumps(list(selected_ids)))
-        show_groups_page(chat_id, message_id, primary_ub, page)
-        bot.answer_callback_query(call.id, "✅ Selected all groups!")
 
-    elif data.startswith("gm_all_clr_"):
-        page = int(data.split("_")[-1])
-        primary_ub = str(selected_ubs[0])
-        set_setting("gm_selected_group_ids", "[]")
-        show_groups_page(chat_id, message_id, primary_ub, page)
-        bot.answer_callback_query(call.id, "🗑 Cleared all selections!")
-
-    elif data.startswith("gm_set_loggrp_"):
-        admin_states[uid] = "awaiting_gm_update_group"
-        bot.send_message(
-            chat_id,
-            "📢 *SET UPDATE/LOG GROUP*\n\n"
-            "Please send the Group Chat ID (e.g. `-1001234567890`) where the status updates, progress report, and failure logs of the Group Mailer should be directed.\n\n"
-            "⚠️ *Note:* If you do not configure this, you will not receive any progress updates or failure reports to avoid spamming the bot direct messages."
-        )
-        bot.answer_callback_query(call.id)
-
-    elif data.startswith("gm_clear_loggrp_"):
-        page = int(data.split("_")[-1])
-        set_setting("gm_update_group_id", "")
-        bot.answer_callback_query(call.id, "❌ Update/Log group removed!")
-        primary_ub = str(selected_ubs[0])
-        show_groups_page(chat_id, message_id, primary_ub, page)
-
-    elif data == "gm_select_msg":
-        admin_states[uid] = "awaiting_gm_message"
-        bot.send_message(
-            chat_id,
-            "💬 *SET MAILER MESSAGE*\n\n"
-            "Please send or forward the message you want to broadcast (can be text, photo, video, or document with captions)."
-        )
-        bot.answer_callback_query(call.id)
-
-    elif data == "gm_import_links":
-        if not selected_ubs:
-            bot.answer_callback_query(call.id, "❌ Please select at least one Userbot first!", show_alert=True)
-            return
-            
-        admin_states[uid] = "awaiting_gm_links"
-        bot.send_message(
-            chat_id,
-            "🔗 *IMPORT GROUP JOIN LINKS*\n\n"
-            "Please send your group links (invite links or usernames, one per line).\n"
-            "Example:\n`t.me/+invitehash`\n`@my_group`"
-        )
-        bot.answer_callback_query(call.id)
-
-    elif data == "gm_repeat_menu":
-        markup = InlineKeyboardMarkup()
-        markup.row(
-            InlineKeyboardButton("❌ Off (Manual)", callback_data="gm_setrep_0"),
-            InlineKeyboardButton("30 Min", callback_data="gm_setrep_30")
-        )
-        markup.row(
-            InlineKeyboardButton("1 Hour", callback_data="gm_setrep_60"),
-            InlineKeyboardButton("2 Hours", callback_data="gm_setrep_120")
-        )
-        markup.row(
-            InlineKeyboardButton("6 Hours", callback_data="gm_setrep_360"),
-            InlineKeyboardButton("12 Hours", callback_data="gm_setrep_720")
-        )
-        markup.row(
-            InlineKeyboardButton("24 Hours", callback_data="gm_setrep_1440")
-        )
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="group_mailer_main"))
-        
-        bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text="⏰ *SELECT REPEAT INTERVAL*\nConfigure how often the userbot should automatically broadcast the message:",
-            reply_markup=markup,
-            parse_mode="Markdown"
-        )
-
-    elif data.startswith("gm_setrep_"):
-        minutes = int(data.split("_")[-1])
-        set_setting("gm_repeat_interval", str(minutes))
-        bot.answer_callback_query(call.id, "✅ Repeat interval updated!")
-        handle_group_mailer_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': 'group_mailer_main', 'message': call.message, 'id': call.id})())
-
-    elif data == "gm_start_op":
-        selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
-        msg_data = json.loads(get_setting("gm_message") or "{}")
-
-        if not selected_ubs:
-            bot.answer_callback_query(call.id, "❌ Please select at least one Userbot first!", show_alert=True)
-            return
-        if not selected_groups:
-            bot.answer_callback_query(call.id, "❌ Please select target groups first!", show_alert=True)
-            return
-        if not msg_data:
-            bot.answer_callback_query(call.id, "❌ Please set the mailer message first!", show_alert=True)
-            return
-
-        bot.answer_callback_query(call.id, "🚀 Starting operation...")
-        # Dispatch the task safely to the main event loop thread
-        asyncio.run_coroutine_threadsafe(
-            run_broadcast_failover(selected_ubs, selected_groups, msg_data),
-            loop
-        )
-
-# Intercept message state inputs for Group Mailer
-@bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id) and admin_states.get(m.from_user.id) in ["awaiting_gm_message", "awaiting_gm_links", "awaiting_gm_update_group"])
-def handle_mailer_states(message):
+# Intercept message state inputs for Group Mailer Campaign Tasks
+@bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id) and admin_states.get(m.from_user.id) and admin_states.get(m.from_user.id).startswith("awaiting_gm_"))
+def handle_task_states(message):
     uid = message.from_user.id
     chat_id = message.chat.id
     state = admin_states.get(uid)
     text = message.text or ""
 
-    if state == "awaiting_gm_message":
+    if state == "awaiting_gm_task_name":
+        cleaned_name = text.strip()
+        if not cleaned_name:
+            bot.reply_to(message, "❌ Name cannot be empty.")
+            return
+            
+        task_id = db_create_task(cleaned_name)
+        admin_states[uid] = None
+        
+        # Confirmation and direct redirect
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("⚙️ Configure Task", callback_data=f"gm_task_view_{task_id}"))
+        bot.reply_to(
+            message,
+            f"✅ *Task `{cleaned_name}` Created!*",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+    elif state.startswith("awaiting_gm_taskmsg_"):
+        t_id = int(state.split("_")[-1])
         msg_type = "text"
         file_id = None
         caption = message.caption or ""
@@ -545,7 +744,7 @@ def handle_mailer_states(message):
                 downloaded_file = bot.download_file(file_info.file_path)
                 
                 ext = file_info.file_path.split(".")[-1]
-                local_path = os.path.join(MEDIA_DIR, f"mailer_media_{uid}.{ext}")
+                local_path = os.path.join(MEDIA_DIR, f"task_media_{t_id}_{uid}.{ext}")
                 
                 with open(local_path, "wb") as f:
                     f.write(downloaded_file)
@@ -561,27 +760,26 @@ def handle_mailer_states(message):
             "local_path": local_path
         }
         
-        set_setting("gm_message", json.dumps(msg_data))
+        db_update_task(t_id, "message", json.dumps(msg_data))
         admin_states[uid] = None
-        bot.reply_to(message, f"✅ *Mailer Message Saved!* (Type: `{msg_type.upper()}`)", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ *Mailer Message Saved for Task!* (Type: `{msg_type.upper()}`)", parse_mode="Markdown")
 
-    elif state == "awaiting_gm_links":
+    elif state.startswith("awaiting_gm_tasklinks_"):
+        t_id = int(state.split("_")[-1])
         lines = [line.strip() for line in text.split("\n") if line.strip()]
         
-        selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
-        if not selected_ubs:
-            bot.reply_to(message, "❌ Please select at least one userbot first to process links.")
-            return
-            
+        task = db_get_task(t_id)
+        selected_ubs = json.loads(task[2] or "[]")
+        
         client = userbot_fleet_manager.get_client(int(selected_ubs[0]))
         if not client or not client.is_connected():
-            bot.reply_to(message, "❌ Selected primary userbot is offline. Cannot check invite links.")
+            bot.reply_to(message, "❌ Primary userbot is offline. Cannot check invite links.")
             return
 
         bot.reply_to(message, "⏳ Processing and resolving join links...")
         
-        links_map = json.loads(get_setting("gm_group_links_map") or "{}")
-        selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
+        links_map = db_get_links_map()
+        selected_groups = json.loads(task[3] or "[]")
         
         success_count = 0
         
@@ -607,15 +805,14 @@ def handle_mailer_states(message):
 
                     if group_id:
                         final_id = int(group_id)
-                        links_map[str(final_id)] = line
+                        db_save_link(final_id, line)
                         if final_id not in selected_groups:
                             selected_groups.append(final_id)
                         success_count += 1
                 except Exception as e:
                     logger.error(f"Error resolving line {line}: {e}")
 
-            set_setting("gm_group_links_map", json.dumps(links_map))
-            set_setting("gm_selected_group_ids", json.dumps(selected_groups))
+            db_update_task(t_id, "group_ids", json.dumps(selected_groups))
             admin_states[uid] = None
             bot.send_message(
                 chat_id,
@@ -625,32 +822,37 @@ def handle_mailer_states(message):
 
         asyncio.run_coroutine_threadsafe(resolve_links_task(), loop)
 
-    elif state == "awaiting_gm_update_group":
+    elif state.startswith("awaiting_gm_tasklog_"):
+        t_id = int(state.split("_")[-1])
         cleaned_id = text.strip()
         
-        # Verify the format looks like a Telegram group ID
         if not (cleaned_id.startswith("-") and cleaned_id.replace("-", "").isdigit()):
-            bot.reply_to(message, "❌ *Invalid Group ID!*\nGroup IDs must start with a minus (e.g. `-1001234567890`). Please try again.")
+            bot.reply_to(message, "❌ *Invalid Group ID!*\nGroup IDs must start with a minus (e.g. `-1001234567890`).")
             return
             
-        set_setting("gm_update_group_id", cleaned_id)
+        db_update_task(t_id, "update_group_id", cleaned_id)
         admin_states[uid] = None
         bot.reply_to(
             message,
-            f"✅ *Update/Log Group Configured!*\nAll future mailer updates and failure reports will be sent to the group ID: `{cleaned_id}`.\n\n"
-            "⚠️ *Notice:* You must ensure the Admin Bot is added as a member in that group to successfully send updates.",
+            f"✅ *Task Log Group Configured!*\nLogs will go to: `{cleaned_id}`.",
             parse_mode="Markdown"
         )
 
-# Asynchronous broadcast implementation with Multi-Userbot Failover, Auto-Join, and Log Group Redirection
-async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=False):
+
+# Asynchronous campaign execution running failover and joining logic
+async def run_task_broadcast(task_id, is_auto=False):
+    task = db_get_task(task_id)
+    if not task:
+        return
+        
+    _, name, userbot_ids_raw, group_ids_raw, message_raw, interval, _, update_group_id = task
+    ub_ids = json.loads(userbot_ids_raw or "[]")
+    msg_data = json.loads(message_raw or "{}")
+    
     success = 0
     failed = 0
+    label = f"⏰ Scheduled Campaign: {name}" if is_auto else f"📬 Task Mailer: {name}"
     
-    label = "⏰ Scheduled Mailer" if is_auto else "📬 Group Mailer"
-    
-    # Retrieve configuration for Log/Update Group
-    update_group_id = get_setting("gm_update_group_id")
     dest_chat = int(update_group_id) if (update_group_id and update_group_id.strip()) else None
 
     progress_msg = None
@@ -658,31 +860,30 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
         try:
             progress_msg = bot.send_message(dest_chat, f"⏳ *{label} progress:* `0%`", parse_mode="Markdown")
         except Exception as err:
-            logger.error(f"Failed to send initial progress update to log group {dest_chat}: {err}")
+            logger.error(f"Failed to send task progress updates to {dest_chat}: {err}")
 
-    # Save last run timestamp
-    set_setting("gm_last_run", str(time.time()))
+    # Update database last run timestamp
+    db_update_task(task_id, "last_run", time.time())
     
-    # Store processed IDs in this run
     sent_group_ids = set()
-    
-    # Keep track of detailed failures for reporting
     failed_details = []
-
-    # Map to resolve group title from cached groups
+    
+    # Pre-load group titles from local cache
     group_titles = {}
     for ub_id in ub_ids:
         for g in userbot_groups_cache.get(str(ub_id), []):
             group_titles[g["id"]] = g["title"]
 
     while True:
-        # Fetch live settings on EVERY iteration
-        live_group_ids = json.loads(get_setting("gm_selected_group_ids") or "[]")
-        links_map = json.loads(get_setting("gm_group_links_map") or "{}")
+        # Re-fetch task to load live group ids dynamically on every loop step
+        live_task = db_get_task(task_id)
+        if not live_task:
+            break
+            
+        live_group_ids = json.loads(live_task[3] or "[]")
+        links_map = db_get_links_map()
         
-        # Determine which selected groups haven't been processed yet
         remaining_groups = [g for g in live_group_ids if g not in sent_group_ids]
-        
         if not remaining_groups:
             break
             
@@ -692,17 +893,15 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
         group_sent_successfully = False
         group_errors = []
 
-        # Failover send loop across all selected userbots in order
+        # Iterate over all selected userbots
         for ub_id in ub_ids:
             client = userbot_fleet_manager.get_client(int(ub_id))
             if not client or not client.is_connected():
-                group_errors.append((ub_id, "Userbot client is offline or disconnected"))
+                group_errors.append((ub_id, "Userbot offline"))
                 continue
 
             try:
                 entity = group_id
-                
-                # Resolve entity for target
                 try:
                     if isinstance(group_id, str) and group_id.startswith("@"):
                         entity = await client.get_entity(group_id)
@@ -725,6 +924,7 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
                     else:
                         raise ent_err
 
+                # Send
                 msg_type = msg_data.get("type")
                 if msg_type == "text":
                     await client.send_message(entity, msg_data["text"])
@@ -732,7 +932,7 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
                     await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
                 
                 group_sent_successfully = True
-                break # Success! Exit failover loop for this group
+                break
             except Exception as e:
                 try:
                     join_link = links_map.get(str(group_id))
@@ -748,12 +948,12 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
                             await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
                         
                         group_sent_successfully = True
-                        break # Success! Exit failover loop for this group
+                        break
                 except Exception as retry_err:
                     e = retry_err
                 
                 group_errors.append((ub_id, e))
-                logger.warning(f"Userbot {ub_id} failed to send to {group_id}: {e}")
+                logger.warning(f"Userbot {ub_id} failed to send to {group_id} under Task {task_id}: {e}")
         
         if group_sent_successfully:
             success += 1
@@ -762,11 +962,10 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
             g_title = group_titles.get(group_id, f"ID: {group_id}")
             report_lines = [f"❌ *Group:* `{g_title}`"]
             for ub_id, err in group_errors:
-                friendly_desc = get_friendly_error(err)
-                report_lines.append(f"  ⚠️ *UB {ub_id}:* {friendly_desc}")
+                report_lines.append(f"  ⚠️ *UB {ub_id}:* {get_friendly_error(err)}")
             failed_details.append("\n".join(report_lines))
 
-        # Live progress updates (Only if Log/Update Group is configured)
+        # Live progress update
         total_groups = len(live_group_ids)
         processed_count = len(sent_group_ids)
         
@@ -782,9 +981,8 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
             except Exception:
                 pass
 
-        # Random delay between 5 to 10 seconds to protect account
-        delay = random.randint(5, 10)
-        await asyncio.sleep(delay)
+        # Random delay between 5 to 10 seconds
+        await asyncio.sleep(random.randint(5, 10))
 
     if dest_chat:
         try:
@@ -796,10 +994,10 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
         except Exception:
             pass
 
-    # Send Detailed Failure Report (Only if Log/Update Group is configured)
+    # Send Detailed Failure Report
     if failed_details and dest_chat:
         try:
-            header = f"🚨 *{label} Failure Report:*\nThe message could not be sent to the following groups on all selected accounts:\n\n"
+            header = f"🚨 *{label} Failure Report:*\nThe message could not be sent to these groups on all configured accounts:\n\n"
             current_message = header
             
             for report in failed_details:
@@ -811,36 +1009,40 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=Fa
             if current_message.strip():
                 bot.send_message(dest_chat, current_message, parse_mode="Markdown")
         except Exception as e:
-            logger.error(f"Error sending failure report to log group {dest_chat}: {e}")
+            logger.error(f"Error sending failure report: {e}")
 
-# Background Scheduled Supervisor Loop
+
+# Background Scheduled Supervisor Loop for Campaign Tasks
 async def scheduler_loop():
-    logger.info("⏰ Group Mailer background scheduler loop running...")
+    logger.info("⏰ Group Mailer Tasks scheduler supervisor loop running...")
     while True:
         try:
-            interval_minutes = int(get_setting("gm_repeat_interval") or "0")
-            if interval_minutes > 0:
-                last_run = float(get_setting("gm_last_run") or "0")
-                now = time.time()
+            # Query all tasks with repeat schedules
+            with main_module.db_conn() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id, name, repeat_interval, last_run, userbot_ids, group_ids, message FROM gm_tasks WHERE repeat_interval > 0")
+                tasks = c.fetchall()
                 
-                if now - last_run >= (interval_minutes * 60):
-                    selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
-                    selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
-                    msg_data = json.loads(get_setting("gm_message") or "{}")
+            for t_id, name, interval, last_run, userbot_ids_raw, group_ids_raw, message_raw in tasks:
+                now = time.time()
+                if now - last_run >= (interval * 60):
+                    ub_ids = json.loads(userbot_ids_raw or "[]")
+                    selected_groups = json.loads(group_ids_raw or "[]")
+                    msg_data = json.loads(message_raw or "{}")
                     
-                    if selected_ubs and selected_groups and msg_data:
+                    if ub_ids and selected_groups and msg_data:
                         has_active_client = False
-                        for ub_id in selected_ubs:
+                        for ub_id in ub_ids:
                             client = userbot_fleet_manager.get_client(int(ub_id))
                             if client and client.is_connected():
                                 has_active_client = True
                                 break
                                 
                         if has_active_client:
-                            # Execute scheduled broadcast
-                            await run_broadcast_failover(selected_ubs, selected_groups, msg_data, is_auto=True)
+                            # Start campaign task asynchronously
+                            await run_task_broadcast(t_id, is_auto=True)
         except Exception as e:
-            logger.error(f"Error in Group Mailer scheduler loop: {e}")
+            logger.error(f"Error in Tasks scheduler loop: {e}")
             
         await asyncio.sleep(30)  # Check every 30 seconds
 
