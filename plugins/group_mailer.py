@@ -47,6 +47,7 @@ def get_mailer_status():
     msg_data = json.loads(get_setting("gm_message") or "{}")
     interval = int(get_setting("gm_repeat_interval") or "0")
     links_map = json.loads(get_setting("gm_group_links_map") or "{}")
+    update_group = get_setting("gm_update_group_id")
     
     ub_status = f"🔴 None"
     if selected_ubs:
@@ -73,10 +74,13 @@ def get_mailer_status():
     if last_run_timestamp > 0:
         last_run_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_run_timestamp))
         
+    update_group_status = f"`{update_group}`" if update_group else "🔴 Muted (No log updates)"
+        
     return (
         f"👤 *Selected Userbots:* {ub_status}\n"
         f"👥 *Groups Selected:* `{len(selected_groups)}` groups marked\n"
         f"🔗 *Mapped Join Links:* `{len(links_map)}` links stored\n"
+        f"📢 *Update Group:* {update_group_status}\n"
         f"💬 *Mailer Message:* {msg_status}\n"
         f"⏰ *Repeat Interval:* `{rep_status}`\n"
         f"📅 *Last Run:* `{last_run_time}`"
@@ -110,13 +114,11 @@ async def join_group_via_client(client, link):
         return False
     try:
         if "+" in link or "joinchat/" in link:
-            # Private invite
             hash_val = link.split("+")[-1].strip() if "+" in link else link.split("joinchat/")[-1].strip()
             hash_val = hash_val.split("/")[0].split("?")[0]
             await client(ImportChatInviteRequest(hash_val))
             return True
         else:
-            # Public username
             username = link
             if "t.me/" in link:
                 username = link.split("t.me/")[-1].split("/")[0].split("?")[0]
@@ -155,6 +157,7 @@ async def fetch_dialogs_async(client, ub_id):
 def show_groups_page(chat_id, message_id, ub_id, page=0):
     groups = userbot_groups_cache.get(ub_id, [])
     selected_ids = set(json.loads(get_setting("gm_selected_group_ids") or "[]"))
+    update_group_id = get_setting("gm_update_group_id")
     
     if not groups:
         markup = InlineKeyboardMarkup()
@@ -201,13 +204,20 @@ def show_groups_page(chat_id, message_id, ub_id, page=0):
         InlineKeyboardButton("Clear All", callback_data=f"gm_all_clr_{page}"),
         InlineKeyboardButton("🔄 Refresh", callback_data=f"gm_refresh_{page}")
     )
+
+    # Log/Update group configuration row
+    log_group_btn_text = f"📢 Group: {update_group_id}" if update_group_id else "📢 Set Update Group"
+    markup.row(
+        InlineKeyboardButton(log_group_btn_text, callback_data=f"gm_set_loggrp_{page}"),
+        InlineKeyboardButton("❌ Remove Group", callback_data=f"gm_clear_loggrp_{page}")
+    )
     
     markup.add(InlineKeyboardButton("🔙 Back to Mailer Console", callback_data="group_mailer_main"))
     
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
-        text=f"👥 *SELECT TARGET GROUPS* (Selected: `{len(selected_ids)}`)\nToggle target checkboxes. Click **Refresh** if userbot joined new groups recently:",
+        text=f"👥 *SELECT TARGET GROUPS* (Selected: `{len(selected_ids)}`)\nToggle target checkboxes. Click **Refresh** to sync new groups:",
         reply_markup=markup,
         parse_mode="Markdown"
     )
@@ -225,8 +235,6 @@ def handle_group_mailer_callbacks(call):
     selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
 
     if data == "group_mailer_main":
-        set_setting("gm_admin_chat_id", str(chat_id))
-        
         interval = int(get_setting("gm_repeat_interval") or "0")
         if interval == 0:
             rep_btn_text = "⏰ Repeat: Off"
@@ -412,6 +420,23 @@ def handle_group_mailer_callbacks(call):
         show_groups_page(chat_id, message_id, primary_ub, page)
         bot.answer_callback_query(call.id, "🗑 Cleared all selections!")
 
+    elif data.startswith("gm_set_loggrp_"):
+        admin_states[uid] = "awaiting_gm_update_group"
+        bot.send_message(
+            chat_id,
+            "📢 *SET UPDATE/LOG GROUP*\n\n"
+            "Please send the Group Chat ID (e.g. `-1001234567890`) where the status updates, progress report, and failure logs of the Group Mailer should be directed.\n\n"
+            "⚠️ *Note:* If you do not configure this, you will not receive any progress updates or failure reports to avoid spamming the bot direct messages."
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data.startswith("gm_clear_loggrp_"):
+        page = int(data.split("_")[-1])
+        set_setting("gm_update_group_id", "")
+        bot.answer_callback_query(call.id, "❌ Update/Log group removed!")
+        primary_ub = str(selected_ubs[0])
+        show_groups_page(chat_id, message_id, primary_ub, page)
+
     elif data == "gm_select_msg":
         admin_states[uid] = "awaiting_gm_message"
         bot.send_message(
@@ -483,17 +508,19 @@ def handle_group_mailer_callbacks(call):
             return
 
         bot.answer_callback_query(call.id, "🚀 Starting operation...")
+        # Dispatch the task safely to the main event loop thread
         asyncio.run_coroutine_threadsafe(
-            run_broadcast_failover(selected_ubs, selected_groups, msg_data, chat_id),
+            run_broadcast_failover(selected_ubs, selected_groups, msg_data),
             loop
         )
 
 # Intercept message state inputs for Group Mailer
-@bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id) and admin_states.get(m.from_user.id) in ["awaiting_gm_message", "awaiting_gm_links"])
+@bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id) and admin_states.get(m.from_user.id) in ["awaiting_gm_message", "awaiting_gm_links", "awaiting_gm_update_group"])
 def handle_mailer_states(message):
     uid = message.from_user.id
     chat_id = message.chat.id
     state = admin_states.get(uid)
+    text = message.text or ""
 
     if state == "awaiting_gm_message":
         msg_type = "text"
@@ -539,10 +566,8 @@ def handle_mailer_states(message):
         bot.reply_to(message, f"✅ *Mailer Message Saved!* (Type: `{msg_type.upper()}`)", parse_mode="Markdown")
 
     elif state == "awaiting_gm_links":
-        text = message.text or ""
         lines = [line.strip() for line in text.split("\n") if line.strip()]
         
-        # Get active userbot to resolve invite links
         selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
         if not selected_ubs:
             bot.reply_to(message, "❌ Please select at least one userbot first to process links.")
@@ -555,7 +580,6 @@ def handle_mailer_states(message):
 
         bot.reply_to(message, "⏳ Processing and resolving join links...")
         
-        # Read existing map
         links_map = json.loads(get_setting("gm_group_links_map") or "{}")
         selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
         
@@ -567,14 +591,12 @@ def handle_mailer_states(message):
                 try:
                     group_id = None
                     if "+" in line or "joinchat/" in line:
-                        # Private invite
                         hash_val = line.split("+")[-1].strip() if "+" in line else line.split("joinchat/")[-1].strip()
                         hash_val = hash_val.split("/")[0].split("?")[0]
                         invite_info = await client(CheckChatInviteRequest(hash_val))
                         if hasattr(invite_info, 'chat'):
                             group_id = invite_info.chat.id
                     else:
-                        # Public username
                         username = line
                         if "t.me/" in line:
                             username = line.split("t.me/")[-1].split("/")[0].split("?")[0]
@@ -584,13 +606,7 @@ def handle_mailer_states(message):
                         group_id = entity.id
 
                     if group_id:
-                        # Convert to standard Telethon integer representation (make sure it has -100 prefix if supergroup)
                         final_id = int(group_id)
-                        # Avoid raw peer mismatch: Telethon handles IDs as standard negative integers
-                        if str(final_id).startswith("-") or final_id > 0:
-                            pass # standard format
-                        
-                        # Store in map
                         links_map[str(final_id)] = line
                         if final_id not in selected_groups:
                             selected_groups.append(final_id)
@@ -609,19 +625,40 @@ def handle_mailer_states(message):
 
         asyncio.run_coroutine_threadsafe(resolve_links_task(), loop)
 
-# Asynchronous broadcast implementation with Auto-Join and Failover
-async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, chat_id, is_auto=False):
+    elif state == "awaiting_gm_update_group":
+        cleaned_id = text.strip()
+        
+        # Verify the format looks like a Telegram group ID
+        if not (cleaned_id.startswith("-") and cleaned_id.replace("-", "").isdigit()):
+            bot.reply_to(message, "❌ *Invalid Group ID!*\nGroup IDs must start with a minus (e.g. `-1001234567890`). Please try again.")
+            return
+            
+        set_setting("gm_update_group_id", cleaned_id)
+        admin_states[uid] = None
+        bot.reply_to(
+            message,
+            f"✅ *Update/Log Group Configured!*\nAll future mailer updates and failure reports will be sent to the group ID: `{cleaned_id}`.\n\n"
+            "⚠️ *Notice:* You must ensure the Admin Bot is added as a member in that group to successfully send updates.",
+            parse_mode="Markdown"
+        )
+
+# Asynchronous broadcast implementation with Multi-Userbot Failover, Auto-Join, and Log Group Redirection
+async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, is_auto=False):
     success = 0
     failed = 0
     
     label = "⏰ Scheduled Mailer" if is_auto else "📬 Group Mailer"
     
+    # Retrieve configuration for Log/Update Group
+    update_group_id = get_setting("gm_update_group_id")
+    dest_chat = int(update_group_id) if (update_group_id and update_group_id.strip()) else None
+
     progress_msg = None
-    if chat_id:
+    if dest_chat:
         try:
-            progress_msg = bot.send_message(chat_id, f"⏳ *{label} progress:* `0%`", parse_mode="Markdown")
-        except Exception:
-            pass
+            progress_msg = bot.send_message(dest_chat, f"⏳ *{label} progress:* `0%`", parse_mode="Markdown")
+        except Exception as err:
+            logger.error(f"Failed to send initial progress update to log group {dest_chat}: {err}")
 
     # Save last run timestamp
     set_setting("gm_last_run", str(time.time()))
@@ -672,17 +709,12 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, chat_id, i
                     elif isinstance(group_id, str) and group_id.isdigit():
                         entity = int(group_id)
                 except Exception as ent_err:
-                    # If entity resolution fails (e.g. peer not found because userbot is not in the group),
-                    # attempt to auto-join using the link from links_map
                     join_link = links_map.get(str(group_id))
                     if join_link:
                         try:
-                            # Auto-join group
                             await join_group_via_client(client, join_link)
-                            # Wait 5 to 10 seconds random delay after joining
                             join_wait = random.randint(5, 10)
                             await asyncio.sleep(join_wait)
-                            # Re-resolve entity
                             entity = group_id
                             if isinstance(group_id, str) and group_id.startswith("@"):
                                 entity = await client.get_entity(group_id)
@@ -702,18 +734,13 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, chat_id, i
                 group_sent_successfully = True
                 break # Success! Exit failover loop for this group
             except Exception as e:
-                # If exception is a result of not being in group (e.g. ChatWriteForbidden or PeerIdInvalid),
-                # try to auto-join using the join link if we haven't already attempted it above.
                 try:
                     join_link = links_map.get(str(group_id))
                     if join_link and "auto-join failed" not in str(e).lower():
-                        # Try to join the group
                         await join_group_via_client(client, join_link)
-                        # Wait 5 to 10 seconds random delay after joining
                         join_wait = random.randint(5, 10)
                         await asyncio.sleep(join_wait)
                         
-                        # Re-send message
                         msg_type = msg_data.get("type")
                         if msg_type == "text":
                             await client.send_message(entity, msg_data["text"])
@@ -739,15 +766,15 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, chat_id, i
                 report_lines.append(f"  ⚠️ *UB {ub_id}:* {friendly_desc}")
             failed_details.append("\n".join(report_lines))
 
-        # Live progress updates
+        # Live progress updates (Only if Log/Update Group is configured)
         total_groups = len(live_group_ids)
         processed_count = len(sent_group_ids)
         
-        if progress_msg and chat_id and (processed_count % 3 == 0 or processed_count == total_groups):
+        if progress_msg and dest_chat and (processed_count % 3 == 0 or processed_count == total_groups):
             pct = int((processed_count / max(1, total_groups)) * 100)
             try:
                 bot.edit_message_text(
-                    chat_id=chat_id,
+                    chat_id=dest_chat,
                     message_id=progress_msg.message_id,
                     text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}` | Total: `{total_groups}`)",
                     parse_mode="Markdown"
@@ -759,32 +786,32 @@ async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, chat_id, i
         delay = random.randint(5, 10)
         await asyncio.sleep(delay)
 
-    if chat_id:
+    if dest_chat:
         try:
             bot.send_message(
-                chat_id,
+                dest_chat,
                 f"✅ *{label} Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
                 parse_mode="Markdown"
             )
         except Exception:
             pass
 
-    # Send Detailed Failure Report
-    if failed_details and chat_id:
+    # Send Detailed Failure Report (Only if Log/Update Group is configured)
+    if failed_details and dest_chat:
         try:
-            header = f"🚨 *Group Mailer Failure Report:*\nThe message could not be sent to the following groups on all selected accounts:\n\n"
+            header = f"🚨 *{label} Failure Report:*\nThe message could not be sent to the following groups on all selected accounts:\n\n"
             current_message = header
             
             for report in failed_details:
                 if len(current_message) + len(report) + 2 > 4000:
-                    bot.send_message(chat_id, current_message, parse_mode="Markdown")
+                    bot.send_message(dest_chat, current_message, parse_mode="Markdown")
                     current_message = ""
                 current_message += report + "\n\n"
                 
             if current_message.strip():
-                bot.send_message(chat_id, current_message, parse_mode="Markdown")
+                bot.send_message(dest_chat, current_message, parse_mode="Markdown")
         except Exception as e:
-            logger.error(f"Error sending failure report: {e}")
+            logger.error(f"Error sending failure report to log group {dest_chat}: {e}")
 
 # Background Scheduled Supervisor Loop
 async def scheduler_loop():
@@ -810,9 +837,8 @@ async def scheduler_loop():
                                 break
                                 
                         if has_active_client:
-                            admin_chat_id = get_setting("gm_admin_chat_id")
-                            dest_chat = int(admin_chat_id) if admin_chat_id else None
-                            await run_broadcast_failover(selected_ubs, selected_groups, msg_data, dest_chat, is_auto=True)
+                            # Execute scheduled broadcast
+                            await run_broadcast_failover(selected_ubs, selected_groups, msg_data, is_auto=True)
         except Exception as e:
             logger.error(f"Error in Group Mailer scheduler loop: {e}")
             
