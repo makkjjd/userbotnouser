@@ -7503,6 +7503,16 @@ def health():
     
     return "Userbot v2 Running", 200
 
+@app.route("/webhook/<token>", methods=["POST"])
+def telegram_webhook(token):
+    if token == BOT_TOKEN:
+        if request.headers.get("content-type") == "application/json":
+            json_string = request.get_data().decode("utf-8")
+            update = telebot.types.Update.de_json(json_string)
+            bot.process_new_updates([update])
+            return "OK", 200
+    return "Forbidden", 403
+
 def run_web():
     app.run(host="0.0.0.0", port=PORT)
 
@@ -8001,25 +8011,45 @@ async def main():
     except Exception as e: 
         logger.error(f"Userbot startup error: {e}")
 
-    # Start telebot polling with AUTO-RESTART
-    def run_polling():
-        while True:
-            try:
-                logger.info("🚀 Starting Admin Bot polling...")
-                bot.delete_webhook(drop_pending_updates=True)
-                # Reduced timeout and conflict handling
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-            except Exception as e:
-                if "Conflict" in str(e):
-                    logger.warning("⚠️ Main Admin Bot conflict. Retrying in 20s...")
-                    time.sleep(20)
-                else:
-                    logger.error(f"❌ Polling crashed: {e}. Restarting in 30s...")
-                    time.sleep(30)
+    # Configure Webhook if RENDER_EXTERNAL_URL is available, otherwise fallback to polling
+    webhook_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    use_webhook = bool(webhook_url)
     
-    polling_thread = threading.Thread(target=run_polling, daemon=True)
-    polling_thread.start()
-    logger.info("✨ Admin bot monitor started")
+    if use_webhook:
+        try:
+            bot.remove_webhook()
+            success = bot.set_webhook(url=f"{webhook_url}/webhook/{BOT_TOKEN}", drop_pending_updates=True)
+            if success:
+                logger.info(f"🚀 Admin Bot webhook set successfully: {webhook_url}/webhook/<token>")
+            else:
+                logger.error("❌ Failed to set Admin Bot webhook: Telegram returned False.")
+                use_webhook = False
+        except Exception as e:
+            logger.error(f"❌ Failed to set Admin Bot webhook: {e}")
+            use_webhook = False
+            
+    if not use_webhook:
+        # Start telebot polling with AUTO-RESTART
+        def run_polling():
+            while True:
+                try:
+                    logger.info("🚀 Starting Admin Bot polling...")
+                    bot.delete_webhook(drop_pending_updates=True)
+                    # Reduced timeout and conflict handling
+                    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+                except Exception as e:
+                    if "Conflict" in str(e):
+                        logger.warning("⚠️ Main Admin Bot conflict. Retrying in 20s...")
+                        time.sleep(20)
+                    else:
+                        logger.error(f"❌ Polling crashed: {e}. Restarting in 30s...")
+                        time.sleep(30)
+        
+        polling_thread = threading.Thread(target=run_polling, daemon=True)
+        polling_thread.start()
+        logger.info("✨ Admin bot monitor started (Polling Mode)")
+    else:
+        logger.info("✨ Admin bot monitor started (Webhook Mode)")
     
     if userbot:
         try:
