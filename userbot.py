@@ -4,7 +4,7 @@ import re
 import uuid
 from collections import deque
 import asyncio
-
+import telebot
 INSTANCE_ID = str(uuid.uuid4())
 import threading
 import logging
