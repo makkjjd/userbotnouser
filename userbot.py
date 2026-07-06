@@ -372,6 +372,21 @@ def init_db():
                     is_active INTEGER DEFAULT 1
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pending_media_queue (
+                    id SERIAL PRIMARY KEY,
+                    pair_id INTEGER,
+                    source_chat_id BIGINT,
+                    source_msg_id INTEGER,
+                    media_file_path TEXT,
+                    caption TEXT,
+                    grouped_id TEXT,
+                    target_chat_id BIGINT,
+                    target_topic_id BIGINT DEFAULT NULL,
+                    is_restricted INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             # SQLite
             c.execute("""
@@ -539,6 +554,21 @@ def init_db():
                     username TEXT,
                     first_name TEXT,
                     is_active INTEGER DEFAULT 1
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pending_media_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pair_id INTEGER,
+                    source_chat_id BIGINT,
+                    source_msg_id INTEGER,
+                    media_file_path TEXT,
+                    caption TEXT,
+                    grouped_id TEXT,
+                    target_chat_id BIGINT,
+                    target_topic_id BIGINT DEFAULT NULL,
+                    is_restricted INTEGER DEFAULT 0,
+                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
     try:
@@ -2544,9 +2574,11 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                 logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
                 if attempt == 2: # Last attempt
                     logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
+                    raise e
                     
     except Exception as e:
         logger.error(f"Global Mirror Error: {e}")
+        raise e
     finally:
         for path in downloaded_files:
             if os.path.exists(path):
@@ -2592,6 +2624,182 @@ def get_pair_source_counts(pair_id):
         c.execute(f"SELECT COUNT(*) FROM collected_media WHERE pair_id = {p} AND COALESCE(added_by, 'monitor') = 'collection' AND released = 0", (pair_id,))
         col = c.fetchone()[0] or 0
         return mon, scr, col
+
+
+async def queue_failed_messages(client, pair_id, sid, tid, t_topic, messages, is_restricted):
+    logger.info(f"📥 QUEUE: Queueing {len(messages)} messages for pair {pair_id} due to rate limit/error...")
+    
+    # Pre-download all media files locally
+    downloaded_paths = {}
+    for msg in messages:
+        if msg.media:
+            try:
+                logger.info(f"📥 QUEUE: Pre-downloading media for message {msg.id}...")
+                async with media_semaphore:
+                    path = await client.download_media(msg)
+                if path:
+                    downloaded_paths[msg.id] = path
+                    logger.info(f"📥 QUEUE: Downloaded to {path}")
+            except Exception as de:
+                logger.error(f"📥 QUEUE: Failed to download media for msg {msg.id}: {de}")
+                
+    # Add to database queue
+    with db_conn() as conn:
+        c = conn.cursor()
+        for msg in messages:
+            m_path = downloaded_paths.get(msg.id)
+            # If it has no media but it was part of the batch, we can still queue it (as text) or if it has media and download succeeded
+            if msg.media and not m_path:
+                logger.warning(f"📥 QUEUE: Skipping queueing of message {msg.id} because media download failed.")
+                continue
+                
+            p = get_placeholder()
+            if USING_POSTGRES:
+                c.execute(
+                    """INSERT INTO pending_media_queue 
+                    (pair_id, source_chat_id, source_msg_id, media_file_path, caption, grouped_id, target_chat_id, target_topic_id, is_restricted) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (pair_id, sid, msg.id, m_path, msg.message or "", msg.grouped_id, tid, t_topic, 1 if is_restricted else 0)
+                )
+            else:
+                c.execute(
+                    """INSERT INTO pending_media_queue 
+                    (pair_id, source_chat_id, source_msg_id, media_file_path, caption, grouped_id, target_chat_id, target_topic_id, is_restricted) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (pair_id, sid, msg.id, m_path, msg.message or "", msg.grouped_id, tid, t_topic, 1 if is_restricted else 0)
+                )
+
+async def media_queue_worker():
+    """Background worker to process queued media when rate limits are cleared."""
+    logger.info("⏰ Queue Worker: Started.")
+    while True:
+        try:
+            # 1. Fetch all pending queue items
+            items = []
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id, pair_id, source_chat_id, source_msg_id, media_file_path, caption, grouped_id, target_chat_id, target_topic_id, is_restricted FROM pending_media_queue ORDER BY id ASC")
+                items = c.fetchall()
+                
+            if not items:
+                await asyncio.sleep(15)
+                continue
+                
+            # 2. Group items by grouped_id (if not NULL) or process individually
+            grouped = {}
+            ungrouped = []
+            for item in items:
+                gid = item[6]
+                if gid:
+                    grouped.setdefault(gid, []).append(item)
+                else:
+                    ungrouped.append(item)
+                    
+            batches = []
+            for gid, group in grouped.items():
+                batches.append((min(it[0] for it in group), group))
+            for item in ungrouped:
+                batches.append((item[0], [item]))
+                
+            batches.sort(key=lambda x: x[0])
+            
+            for min_id, batch in batches:
+                client = userbot_fleet_manager.get_any_client()
+                if not client or not client.is_connected():
+                    logger.warning("⏰ Queue Worker: No active userbot client. Skipping batch.")
+                    break
+                    
+                first_item = batch[0]
+                queue_ids = [it[0] for it in batch]
+                pair_id = first_item[1]
+                sid = first_item[2]
+                target_chat_id = first_item[7]
+                target_topic_id = first_item[8]
+                is_restricted = first_item[9]
+                
+                logger.info(f"⏰ Queue Worker: Sending batch of {len(batch)} items to target {target_chat_id}...")
+                
+                album_text = next((it[5] for it in batch if it[5]), "")
+                files = [it[4] for it in batch if it[4]]
+                
+                try:
+                    target_entity = await resolve_target_id(client, target_chat_id)
+                except Exception as te:
+                    logger.error(f"⏰ Queue Worker: Failed to resolve target {target_chat_id}: {te}")
+                    continue
+                    
+                reply_header = target_topic_id
+                
+                try:
+                    sent = None
+                    if files:
+                        file_payload = files if len(files) > 1 else files[0]
+                        async with media_semaphore:
+                            sent = await client.send_message(
+                                entity=target_entity,
+                                message=album_text,
+                                file=file_payload,
+                                reply_to=reply_header
+                            )
+                    else:
+                        sent = await client.send_message(
+                            entity=target_entity,
+                            message=album_text,
+                            reply_to=reply_header
+                        )
+                        
+                    if sent:
+                        logger.info(f"⏰ Queue Worker: Successfully sent batch! MSG ID: {sent[0].id if isinstance(sent, list) else sent.id}")
+                        
+                        # Send to vault bot if configured
+                        for token, username, bot_id in get_log_bots():
+                            metadata = f"SID: {sid} | MID: {first_item[3]}\n"
+                            caption_text = metadata + album_text
+                            try:
+                                await client.send_message(
+                                    entity=int(bot_id),
+                                    file=files if len(files) > 1 else (files[0] if files else None),
+                                    message=caption_text
+                                )
+                            except Exception as ve:
+                                logger.error(f"⏰ Queue Worker: Failed to send to vault bot {bot_id}: {ve}")
+                                
+                        # Delete from database
+                        with db_conn() as conn:
+                            c = conn.cursor()
+                            for q_id in queue_ids:
+                                if USING_POSTGRES:
+                                    c.execute("DELETE FROM pending_media_queue WHERE id = %s", (q_id,))
+                                else:
+                                    c.execute("DELETE FROM pending_media_queue WHERE id = ?", (q_id,))
+                                    
+                        # Delete local files to free space
+                        for f_path in files:
+                            if f_path and os.path.exists(f_path):
+                                try:
+                                    os.remove(f_path)
+                                    logger.info(f"⏰ Queue Worker: Cleaned up local file {f_path}")
+                                except Exception as fe:
+                                    logger.error(f"⏰ Queue Worker: Failed to delete file {f_path}: {fe}")
+                                    
+                        # Wait 5 to 10 seconds before sending the next one to avoid rate limits
+                        import random
+                        wait_time = random.uniform(5.0, 10.0)
+                        logger.info(f"⏰ Queue Worker: Waiting {wait_time:.2f}s before next send...")
+                        await asyncio.sleep(wait_time)
+                        
+                except errors.FloodWaitError as fwe:
+                    logger.warning(f"⏰ Queue Worker: Rate limit hit. Must wait {fwe.seconds}s. Pausing worker.")
+                    await notify_admin_flood_wait(client, "Queue Worker", fwe.seconds)
+                    await asyncio.sleep(fwe.seconds)
+                    break
+                except Exception as se:
+                    logger.error(f"⏰ Queue Worker: Failed to send batch: {se}")
+                    await asyncio.sleep(5)
+                    break
+        except Exception as e:
+            logger.error(f"⏰ Queue Worker error: {e}")
+            await asyncio.sleep(15)
 
 
 async def process_automation_pipeline(client, messages, source_chat_id):
@@ -2718,9 +2926,14 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                 if is_protected_flow or is_reply:
                     has_media = any(m.media for m in valid_messages)
                     if is_protected_flow and has_media and not any(m.id in media_to_file for m in valid_messages):
-                        logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed).")
+                        logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed). Queueing instead...")
+                        await queue_failed_messages(client, pid, sid, tid, t_topic, valid_messages, is_protected_flow)
                     else:
-                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
+                        try:
+                            await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
+                        except Exception as sme:
+                            logger.error(f"Live mirror failed: {sme}. Queueing...")
+                            await queue_failed_messages(client, pid, sid, tid, t_topic, valid_messages, is_protected_flow)
                 else:
                     # Unrestricted flow: perform standard native forward safely
                     try:
@@ -2791,7 +3004,11 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                     sec = int(match.group(1))
                             if sec > 0:
                                 await notify_admin_flood_wait(client, "Native Forwarding", sec)
-                        await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid)
+                        try:
+                            await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid)
+                        except Exception as sme:
+                            logger.error(f"Fallback mirror failed: {sme}. Queueing...")
+                            await queue_failed_messages(client, pid, sid, tid, t_topic, valid_messages, is_protected_flow)
 
             # Execution Step C: Backup Storage Vault Allocation
             if is_mon and not already_vaulted:
@@ -7994,6 +8211,7 @@ async def main():
 
     asyncio.create_task(userbot_watchdog())
     asyncio.create_task(instance_coordinator())
+    asyncio.create_task(media_queue_worker())
     threading.Thread(target=keep_alive_worker, daemon=True).start()
 
     # Try to start existing session
