@@ -4,7 +4,7 @@ import re
 import uuid
 from collections import deque
 import asyncio
-import telebot
+
 INSTANCE_ID = str(uuid.uuid4())
 import threading
 import logging
@@ -49,6 +49,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("userbot_v2")
+logging.getLogger("telethon").setLevel(logging.WARNING)
 
 # Topic Mirroring Cache
 # {target_chat_id: {topic_title.lower(): top_message_id}}
