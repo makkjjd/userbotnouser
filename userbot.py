@@ -8156,6 +8156,12 @@ log_bot_manager = LogBotManager()
 # Main Loop
 # -----------------------------
 async def main():
+    try:
+        bot_info = bot.get_me()
+        logger.info(f"🤖 Main Admin Bot Token belongs to: @{bot_info.username} (ID: {bot_info.id})")
+    except Exception as e:
+        logger.error(f"❌ Failed to get main bot info: {e}")
+
     # Load external plugins dynamically from plugins directory
     plugins_dir = os.path.join(os.path.dirname(__file__), "plugins")
     if os.path.exists(plugins_dir):
