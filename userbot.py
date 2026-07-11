@@ -2586,6 +2586,23 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                 except Exception: pass
 
 
+def contains_link(message_text, entities=None):
+    if not message_text:
+        return False
+    import re
+    url_pattern = re.compile(
+        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+    )
+    if url_pattern.search(message_text):
+        return True
+    if entities:
+        for ent in entities:
+            ent_type = type(ent).__name__
+            if ent_type in ["MessageEntityUrl", "MessageEntityTextUrl"]:
+                return True
+    return False
+
+
 def get_specific_media_type(media):
     if not media:
         return "text"
@@ -2890,6 +2907,11 @@ async def process_automation_pipeline(client, messages, source_chat_id):
             cf_val = cf or "everything"
             valid_messages = []
             for msg in messages:
+                # If message contains link, bypass the media/text/file filter entirely
+                if contains_link(msg.message, msg.entities):
+                    valid_messages.append(msg)
+                    continue
+                    
                 m_type = get_specific_media_type(msg.media)
                 if cf_val == "media" and m_type not in ["photo", "video"]:
                     continue
@@ -6222,13 +6244,16 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     continue
 
                 cf_val = cf or "everything"
-                m_type = get_specific_media_type(m.media)
-                if cf_val == "media" and m_type not in ["photo", "video"]:
-                    continue
-                if cf_val == "text" and m_type != "text":
-                    continue
-                if cf_val == "file" and m_type != "file":
-                    continue
+                if contains_link(m.message, m.entities):
+                    pass
+                else:
+                    m_type = get_specific_media_type(m.media)
+                    if cf_val == "media" and m_type not in ["photo", "video"]:
+                        continue
+                    if cf_val == "text" and m_type != "text":
+                        continue
+                    if cf_val == "file" and m_type != "file":
+                        continue
 
                 if task_key in history_options:
                     history_options[task_key].update({
@@ -6889,19 +6914,22 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     continue
                 
                 cf_val = opts.get("collect_filter", "everything")
-                m_type = get_specific_media_type(m.media)
-                if cf_val == "media" and m_type not in ["photo", "video"]:
-                    opts["filtered"] += 1
-                    opts.update({"scanned": scanned, "progress": progress})
-                    continue
-                if cf_val == "text" and m_type != "text":
-                    opts["filtered"] += 1
-                    opts.update({"scanned": scanned, "progress": progress})
-                    continue
-                if cf_val == "file" and m_type != "file":
-                    opts["filtered"] += 1
-                    opts.update({"scanned": scanned, "progress": progress})
-                    continue
+                if contains_link(m.message, m.entities):
+                    pass
+                else:
+                    m_type = get_specific_media_type(m.media)
+                    if cf_val == "media" and m_type not in ["photo", "video"]:
+                        opts["filtered"] += 1
+                        opts.update({"scanned": scanned, "progress": progress})
+                        continue
+                    if cf_val == "text" and m_type != "text":
+                        opts["filtered"] += 1
+                        opts.update({"scanned": scanned, "progress": progress})
+                        continue
+                    if cf_val == "file" and m_type != "file":
+                        opts["filtered"] += 1
+                        opts.update({"scanned": scanned, "progress": progress})
+                        continue
                 
                 is_dup = False
                 try:
