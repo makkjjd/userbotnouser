@@ -2819,6 +2819,167 @@ async def media_queue_worker():
             await asyncio.sleep(15)
 
 
+async def check_dead_accounts_loop():
+    logger.info("⏰ Health Check Worker: Started.")
+    # Initial sleep to allow bot startup and connections to settle
+    await asyncio.sleep(60)
+    
+    while True:
+        try:
+            logger.info("⏳ Health Check: Running userbot and manager accounts check...")
+            
+            # 1. Fetch and verify userbot sessions
+            sessions = []
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id, phone, session_string, username, first_name, api_id, api_hash, user_id FROM userbot_sessions")
+                sessions = c.fetchall()
+                
+            dead_userbots = []
+            alive_userbots = []
+            
+            for s_id, phone, session_str, username, first_name, api_id, api_hash, user_id in sessions:
+                is_alive = False
+                temp_client = None
+                latest_uname = username
+                latest_fname = first_name
+                try:
+                    from telethon.sessions import StringSession
+                    temp_client = TelegramClient(
+                        StringSession(session_str),
+                        int(api_id),
+                        api_hash,
+                        device_model="PC 64bit",
+                        system_version="Windows 11",
+                        app_version="4.11.2"
+                    )
+                    await temp_client.connect()
+                    if await temp_client.is_user_authorized():
+                        me = await temp_client.get_me()
+                        if me:
+                            is_alive = True
+                            latest_uname = me.username or ""
+                            latest_fname = me.first_name or ""
+                            alive_userbots.append((s_id, latest_uname, latest_fname))
+                except Exception as ex:
+                    logger.warning(f"Health Check: Userbot {phone} check failed: {ex}")
+                finally:
+                    if temp_client:
+                        try:
+                            await temp_client.disconnect()
+                        except:
+                            pass
+                            
+                if not is_alive:
+                    dead_userbots.append((s_id, phone, username or first_name or "Unknown", user_id))
+                    
+            # 2. Fetch and verify manager accounts
+            managers = []
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("SELECT user_id, username FROM managers")
+                managers = c.fetchall()
+                
+            dead_managers = []
+            alive_managers = []
+            
+            client = userbot_fleet_manager.get_any_client()
+            if client and client.is_connected():
+                for m_id, m_name in managers:
+                    is_m_alive = True
+                    latest_m_uname = m_name
+                    try:
+                        entity = await client.get_entity(m_id)
+                        if getattr(entity, 'deleted', False):
+                            is_m_alive = False
+                        else:
+                            latest_m_uname = entity.username or ""
+                            alive_managers.append((m_id, latest_m_uname))
+                    except errors.UserDeactivatedError:
+                        is_m_alive = False
+                    except Exception:
+                        pass
+                        
+                    if not is_m_alive:
+                        dead_managers.append((m_id, m_name))
+                        
+            # 3. Process Dead/Alive Actions
+            if dead_userbots:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    for s_id, phone, name, u_id in dead_userbots:
+                        if USING_POSTGRES:
+                            c.execute("DELETE FROM userbot_sessions WHERE id = %s", (s_id,))
+                        else:
+                            c.execute("DELETE FROM userbot_sessions WHERE id = ?", (s_id,))
+                            
+                        # Disconnect client from active fleet manager
+                        if u_id in userbot_fleet_manager.clients:
+                            try:
+                                cl = userbot_fleet_manager.clients.pop(u_id)
+                                await cl.disconnect()
+                            except:
+                                pass
+                                
+                # Stop all active tasks since a userbot is dead
+                for task_key in list(running_tasks.keys()):
+                    stop_task(task_key)
+                    logger.info(f"Health Check: Stopped task {task_key} due to dead userbot.")
+                    
+            if dead_managers:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    for m_id, m_name in dead_managers:
+                        if USING_POSTGRES:
+                            c.execute("DELETE FROM managers WHERE user_id = %s", (m_id,))
+                        else:
+                            c.execute("DELETE FROM managers WHERE user_id = ?", (m_id,))
+                            
+            # Update alive entries
+            if alive_userbots:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    for s_id, uname, fname in alive_userbots:
+                        if USING_POSTGRES:
+                            c.execute("UPDATE userbot_sessions SET is_active = 1, username = %s, first_name = %s WHERE id = %s", (uname, fname, s_id))
+                        else:
+                            c.execute("UPDATE userbot_sessions SET is_active = ?, username = ?, first_name = ? WHERE id = ?", (uname, fname, s_id))
+                            
+            if alive_managers:
+                with db_conn() as conn:
+                    c = conn.cursor()
+                    for m_id, uname in alive_managers:
+                        if USING_POSTGRES:
+                            c.execute("UPDATE managers SET username = %s WHERE user_id = %s", (uname, m_id))
+                        else:
+                            c.execute("UPDATE managers SET username = ? WHERE user_id = ?", (uname, m_id))
+                            
+            # 4. Notify Admin if any accounts are dead
+            if dead_userbots or dead_managers:
+                msg = "🚨 *Health Check Alert: Dead Accounts Detected!*\n\n"
+                if dead_userbots:
+                    msg += "⚠️ *Dead Userbots (Removed from DB & Fleet):*\n"
+                    for _, phone, name, _ in dead_userbots:
+                        msg += f"• Phone: `{phone}` | Name/User: `{name}`\n"
+                    msg += "\n*Note:* Ongoing scrape/collection tasks have been stopped.\n\n"
+                if dead_managers:
+                    msg += "⚠️ *Dead Manager Accounts (Removed from DB):*\n"
+                    for m_id, m_name in dead_managers:
+                        msg += f"• ID: `{m_id}` | Username: `@{m_name if m_name else 'None'}`\n"
+                
+                try:
+                    bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+                except Exception as ne:
+                    logger.error(f"Failed to send health check alert to admin: {ne}")
+            else:
+                logger.info("Health Check: Completed. All accounts are healthy.")
+                
+        except Exception as e:
+            logger.error(f"Error in health check loop: {e}")
+            
+        await asyncio.sleep(24 * 3600)
+
+
 async def process_automation_pipeline(client, messages, source_chat_id):
     """
     Unified execution core. 
@@ -8246,6 +8407,7 @@ async def main():
     asyncio.create_task(userbot_watchdog())
     asyncio.create_task(instance_coordinator())
     asyncio.create_task(media_queue_worker())
+    asyncio.create_task(check_dead_accounts_loop())
     threading.Thread(target=keep_alive_worker, daemon=True).start()
 
     # Try to start existing session
