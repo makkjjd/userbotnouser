@@ -2823,7 +2823,8 @@ async def media_queue_worker():
                             else:
                                 logger.warning(f"⏰ Queue Worker: File {f_path} not found. Attempting to re-download message {msg_id} from {sid}...")
                                 try:
-                                    msg = await active_client.get_messages(int(sid), ids=int(msg_id))
+                                    src_ent = await resolve_target_id(active_client, int(sid))
+                                    msg = await active_client.get_messages(src_ent, ids=int(msg_id))
                                     if msg and msg.media:
                                         async with media_semaphore:
                                             new_path = await active_client.download_media(msg)
