@@ -2483,8 +2483,16 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
 
                 for attempt in range(3):
                     try:
-                        # Attempt native forward first if not restricted/pre-downloaded to preserve the forward tag
-                        if not pre_downloaded and not downloaded_files:
+                        # Attempt native forward first if not restricted/pre-downloaded/protected to preserve the forward tag
+                        is_source_protected = False
+                        try:
+                            resolved_sid = await resolve_target_id(active_client, sid)
+                            if getattr(resolved_sid, 'noforwards', False):
+                                is_source_protected = True
+                        except Exception:
+                            pass
+                            
+                        if not pre_downloaded and not downloaded_files and not is_source_protected:
                             try:
                                 import random
                                 random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
@@ -3343,7 +3351,11 @@ def setup_automation_handlers(client: TelegramClient):
                                 if u_id not in reacting_managers:
                                     reacting_managers.append(u_id)
             except Exception as e:
-                logger.error(f"Failed to fetch reaction list via GetMessageReactionsListRequest: {e}")
+                err_str = str(e).lower()
+                if "message id" in err_str or "invalid" in err_str:
+                    logger.debug(f"Failed to fetch reaction list (expected invalid ID): {e}")
+                else:
+                    logger.error(f"Failed to fetch reaction list via GetMessageReactionsListRequest: {e}")
 
         if not reacting_managers and is_group_or_channel:
             if hasattr(event, 'reactions') and event.reactions and getattr(event.reactions, 'recent_reactions', None):
