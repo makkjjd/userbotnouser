@@ -2772,12 +2772,20 @@ async def media_queue_worker():
             batches.sort(key=lambda x: x[0])
             
             for min_id, batch in batches:
-                client = userbot_fleet_manager.get_any_client()
-                if not client or not client.is_connected():
+                primary_client = userbot_fleet_manager.get_any_client()
+                if not primary_client or not primary_client.is_connected():
                     logger.warning("⏰ Queue Worker: No active userbot client. Skipping batch.")
                     await asyncio.sleep(15)
                     break
-                    
+                
+                clients_pool = [primary_client]
+                fallback_str = get_setting("fallback_userbot_ids") or ""
+                fallback_ids = [int(x) for x in fallback_str.split(",") if x.strip()]
+                for c in userbot_fleet_manager.get_all_clients():
+                    if c.is_connected() and c != primary_client:
+                        if hasattr(c, '_me') and c._me and c._me.id in fallback_ids:
+                            clients_pool.append(c)
+                
                 first_item = batch[0]
                 queue_ids = [it[0] for it in batch]
                 pair_id = first_item[1]
@@ -2790,81 +2798,100 @@ async def media_queue_worker():
                 
                 album_text = next((it[5] for it in batch if it[5]), "")
                 files = [it[4] for it in batch if it[4]]
-                
-                try:
-                    target_entity = await resolve_target_id(client, target_chat_id)
-                except Exception as te:
-                    logger.error(f"⏰ Queue Worker: Failed to resolve target {target_chat_id}: {te}")
-                    continue
-                    
                 reply_header = target_topic_id
                 
-                try:
-                    sent = None
-                    if files:
-                        file_payload = files if len(files) > 1 else files[0]
-                        async with media_semaphore:
-                            sent = await client.send_message(
+                sent = None
+                last_err = Exception("No clients available to send")
+                
+                for active_client in clients_pool:
+                    client_name = getattr(active_client._me, 'first_name', 'Unknown')
+                    logger.info(f"⏰ Queue Worker: Attempting send using client {client_name}...")
+                    try:
+                        target_entity = await resolve_target_id(active_client, target_chat_id)
+                    except Exception as te:
+                        logger.error(f"⏰ Queue Worker: Failed to resolve target {target_chat_id} for client {client_name}: {te}")
+                        last_err = te
+                        continue
+                    
+                    try:
+                        if files:
+                            file_payload = files if len(files) > 1 else files[0]
+                            async with media_semaphore:
+                                sent = await active_client.send_message(
+                                    entity=target_entity,
+                                    message=album_text,
+                                    file=file_payload,
+                                    reply_to=reply_header
+                                )
+                        else:
+                            sent = await active_client.send_message(
                                 entity=target_entity,
                                 message=album_text,
-                                file=file_payload,
                                 reply_to=reply_header
                             )
-                    else:
-                        sent = await client.send_message(
-                            entity=target_entity,
-                            message=album_text,
-                            reply_to=reply_header
-                        )
-                        
-                    if sent:
-                        logger.info(f"⏰ Queue Worker: Successfully sent batch! MSG ID: {sent[0].id if isinstance(sent, list) else sent.id}")
-                        
-                        # Send to vault bot if configured
-                        for token, username, bot_id in get_log_bots():
-                            metadata = f"SID: {sid} | MID: {first_item[3]}\n"
-                            caption_text = metadata + album_text
-                            try:
-                                await client.send_message(
-                                    entity=int(bot_id),
-                                    file=files if len(files) > 1 else (files[0] if files else None),
-                                    message=caption_text
-                                )
-                            except Exception as ve:
-                                logger.error(f"⏰ Queue Worker: Failed to send to vault bot {bot_id}: {ve}")
+                        if sent:
+                            logger.info(f"⏰ Queue Worker: Successfully sent batch via {client_name}! MSG ID: {sent[0].id if isinstance(sent, list) else sent.id}")
+                            break
+                    except errors.FloodWaitError as fwe:
+                        logger.warning(f"⏰ Queue Worker: Client {client_name} hit rate limit. Must wait {fwe.seconds}s.")
+                        last_err = fwe
+                        if active_client != clients_pool[-1]:
+                            logger.info("🔄 FAILOVER: Trying next userbot in pool for queue worker.")
+                            continue
+                        else:
+                            await notify_admin_flood_wait(active_client, "Queue Worker", fwe.seconds)
+                            await asyncio.sleep(fwe.seconds)
+                            break
+                    except Exception as se:
+                        logger.error(f"⏰ Queue Worker: Client {client_name} failed to send batch: {se}")
+                        last_err = se
+                        if active_client != clients_pool[-1]:
+                            continue
+                        else:
+                            await asyncio.sleep(5)
+                            break
+                
+                if sent:
+                    # Send to vault bot if configured using the client that successfully sent it
+                    for token, username, bot_id in get_log_bots():
+                        metadata = f"SID: {sid} | MID: {first_item[3]}\n"
+                        caption_text = metadata + album_text
+                        try:
+                            await active_client.send_message(
+                                entity=int(bot_id),
+                                file=files if len(files) > 1 else (files[0] if files else None),
+                                message=caption_text
+                            )
+                        except Exception as ve:
+                            logger.error(f"⏰ Queue Worker: Failed to send to vault bot {bot_id}: {ve}")
+                            
+                    # Delete from database
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        for q_id in queue_ids:
+                            if USING_POSTGRES:
+                                c.execute("DELETE FROM pending_media_queue WHERE id = %s", (q_id,))
+                            else:
+                                c.execute("DELETE FROM pending_media_queue WHERE id = ?", (q_id,))
                                 
-                        # Delete from database
-                        with db_conn() as conn:
-                            c = conn.cursor()
-                            for q_id in queue_ids:
-                                if USING_POSTGRES:
-                                    c.execute("DELETE FROM pending_media_queue WHERE id = %s", (q_id,))
-                                else:
-                                    c.execute("DELETE FROM pending_media_queue WHERE id = ?", (q_id,))
-                                    
-                        # Delete local files to free space
-                        for f_path in files:
-                            if f_path and os.path.exists(f_path):
-                                try:
-                                    os.remove(f_path)
-                                    logger.info(f"⏰ Queue Worker: Cleaned up local file {f_path}")
-                                except Exception as fe:
-                                    logger.error(f"⏰ Queue Worker: Failed to delete file {f_path}: {fe}")
-                                    
-                        # Wait 5 to 10 seconds before sending the next one to avoid rate limits
-                        import random
-                        wait_time = random.uniform(5.0, 10.0)
-                        logger.info(f"⏰ Queue Worker: Waiting {wait_time:.2f}s before next send...")
-                        await asyncio.sleep(wait_time)
-                        
-                except errors.FloodWaitError as fwe:
-                    logger.warning(f"⏰ Queue Worker: Rate limit hit. Must wait {fwe.seconds}s. Pausing worker.")
-                    await notify_admin_flood_wait(client, "Queue Worker", fwe.seconds)
-                    await asyncio.sleep(fwe.seconds)
-                    break
-                except Exception as se:
-                    logger.error(f"⏰ Queue Worker: Failed to send batch: {se}")
-                    await asyncio.sleep(5)
+                    # Delete local files to free space
+                    for f_path in files:
+                        if f_path and os.path.exists(f_path):
+                            try:
+                                os.remove(f_path)
+                                logger.info(f"⏰ Queue Worker: Cleaned up local file {f_path}")
+                            except Exception as fe:
+                                logger.error(f"⏰ Queue Worker: Failed to delete file {f_path}: {fe}")
+                                
+                    # Wait 5 to 10 seconds before sending the next one to avoid rate limits
+                    import random
+                    wait_time = random.uniform(5.0, 10.0)
+                    logger.info(f"⏰ Queue Worker: Waiting {wait_time:.2f}s before next send...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"⏰ Queue Worker: Batch failed to send on all clients: {last_err}")
+                    if not isinstance(last_err, errors.FloodWaitError):
+                        await asyncio.sleep(15)
                     break
         except Exception as e:
             logger.error(f"⏰ Queue Worker error: {e}")
@@ -2996,93 +3023,24 @@ async def process_automation_pipeline(client, messages, source_chat_id):
 
             # Execution Step B: Live Mirror/Forward Engine Routine
             if is_live:
-                is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in valid_messages)
-                if is_protected_flow or is_reply:
-                    has_media = any(m.media for m in valid_messages)
-                    if is_protected_flow and has_media and not any(m.id in media_to_file for m in valid_messages):
-                        logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed). Queueing instead...")
-                        await queue_failed_messages(client, pid, sid, tid, t_topic, valid_messages, is_protected_flow)
-                    else:
-                        try:
-                            await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
-                        except Exception as sme:
-                            logger.error(f"Live mirror failed: {sme}. Queueing...")
-                            await queue_failed_messages(client, pid, sid, tid, t_topic, valid_messages, is_protected_flow)
+                has_media = any(m.media for m in valid_messages)
+                if is_protected_flow and has_media and not any(m.id in media_to_file for m in valid_messages):
+                    logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed). Queueing instead...")
+                    await queue_failed_messages(client, pid, sid, tid, t_topic, valid_messages, is_protected_flow)
                 else:
-                    # Unrestricted flow: perform standard native forward safely
                     try:
-                        src_peer = await client.get_input_entity(int(sid))
-                        tgt_peer = await client.get_input_entity(int(tid))
-                        
-                        dest_topic_id = t_topic
-                        if is_mir:
-                            if msg_topic_anchor:
-                                forum = getattr(first_msg.reply_to, "forum_topic", None) if first_msg.reply_to else None
-                                src_title = getattr(forum, "title", None)
-                                src_icon = None
-                                if not src_title:
-                                    try:
-                                        resolved_sid = await resolve_target_id(client, sid)
-                                        res = await client(functions.messages.GetForumTopicsRequest(
-                                            peer=resolved_sid, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                                        ))
-                                        for t in res.topics:
-                                            if t.id == msg_topic_anchor:
-                                                src_title = t.title
-                                                src_icon = getattr(t, "icon_emoji_id", None)
-                                                break
-                                    except Exception: pass
-                                
-                                if src_title:
-                                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, msg_topic_anchor, icon_emoji_id=src_icon)
-
-                        import random
-                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in valid_messages]
-                        target_entity = await resolve_target_id(client, tid)
-                        is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
-                        
-                        top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
-                        
-                        fwd_res = await client(functions.messages.ForwardMessagesRequest(
-                            from_peer=src_peer,
-                            id=[msg.id for msg in valid_messages],
-                            to_peer=target_entity,
-                            random_id=random_ids,
-                            top_msg_id=top_msg_id_val
-                        ))
-                        
-                        if fwd_res:
-                            fwd_msgs = []
-                            if hasattr(fwd_res, 'updates'):
-                                for u in fwd_res.updates:
-                                    if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
-                                        fwd_msgs.append(u.message)
-                            
-                            if len(fwd_msgs) == len(valid_messages):
-                                for orig_m, fwd_m in zip(valid_messages, fwd_msgs):
-                                    save_message_mapping(sid, orig_m.id, tid, fwd_m.id)
-                                    logger.info(f"✅ FORWARD: Native forward mapping established {orig_m.id} -> {fwd_m.id}")
-                            else:
-                                logger.info(f"✅ FORWARD: Native forward successful across cluster from {sid}")
-                                
-                    except Exception as fwd_err:
-                        logger.error(f"Native Forward dropped ({fwd_err}). Activating fallback downmirror...")
-                        if "wait of" in str(fwd_err).lower() or isinstance(fwd_err, errors.FloodWaitError):
-                            sec = 0
-                            if isinstance(fwd_err, errors.FloodWaitError):
-                                sec = fwd_err.seconds
-                            else:
-                                import re
-                                match = re.search(r"wait of (\d+) seconds", str(fwd_err), re.IGNORECASE)
-                                if match:
-                                    sec = int(match.group(1))
-                            if sec > 0:
-                                await notify_admin_flood_wait(client, "Native Forwarding", sec)
-                        try:
-                            await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid)
-                        except Exception as sme:
-                            logger.error(f"Fallback mirror failed: {sme}. Queueing...")
-                            await queue_failed_messages(client, pid, sid, tid, t_topic, valid_messages, is_protected_flow)
+                        await send_mirrored_content(
+                            client, 
+                            tid, 
+                            valid_messages, 
+                            t_topic, 
+                            is_mir, 
+                            sid, 
+                            pre_downloaded=media_to_file if (is_protected_flow and has_media) else None
+                        )
+                    except Exception as sme:
+                        logger.error(f"Live mirror/forward failed: {sme}. Queueing...")
+                        await queue_failed_messages(client, pid, sid, tid, t_topic, valid_messages, is_protected_flow)
 
             # Execution Step C: Backup Storage Vault Allocation
             if is_mon and not already_vaulted:
