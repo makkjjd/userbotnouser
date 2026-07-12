@@ -661,6 +661,8 @@ async def check_and_promote_user(client, user_id, username, text_content, reply_
             await reply_fn(f"❌ Failed to process promotion: {e}")
             return True
             
+last_flood_alert_msgs = {} # {userbot_id: (msg_id, sent_via)}
+
 async def notify_admin_flood_wait(client, action_name, seconds):
     try:
         from datetime import timedelta
@@ -673,14 +675,38 @@ async def notify_admin_flood_wait(client, action_name, seconds):
             f"⚙️ **Action**: `{action_name}`\n"
             f"⏱️ **Wait Required**: `{seconds}s` (~{duration})"
         )
+        
+        # Try to delete previous warning for this specific userbot
+        prev = last_flood_alert_msgs.get(me.id)
+        if prev:
+            try:
+                prev_msg_id, sent_via = prev
+                if sent_via == "bot":
+                    bot.delete_message(ADMIN_ID, prev_msg_id)
+                elif sent_via == "client":
+                    await client.delete_messages(ADMIN_ID, [prev_msg_id])
+            except Exception:
+                pass
+                
+        sent_msg_id = None
+        sent_via = None
+        
         try:
-            bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+            res = bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+            sent_msg_id = res.message_id
+            sent_via = "bot"
         except Exception:
             try:
                 admin_entity = await client.get_entity(ADMIN_ID)
-                await client.send_message(admin_entity, msg)
+                res = await client.send_message(admin_entity, msg)
+                sent_msg_id = res.id
+                sent_via = "client"
             except Exception:
                 pass
+                
+        if sent_msg_id:
+            last_flood_alert_msgs[me.id] = (sent_msg_id, sent_via)
+            
     except Exception as e:
         logger.error(f"Error in notify_admin_flood_wait: {e}")
 
@@ -2332,11 +2358,12 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         
         # 1. Build Client Pool for Failover
         clients_pool = [client]
-        if get_setting("failover_on_ratelimit") == "1":
-            for c in userbot_fleet_manager.get_all_clients():
-                if c.is_connected() and c != client:
-                    if hasattr(c, '_me') and c._me:
-                        clients_pool.append(c)
+        fallback_str = get_setting("fallback_userbot_ids") or ""
+        fallback_ids = [int(x) for x in fallback_str.split(",") if x.strip()]
+        for c in userbot_fleet_manager.get_all_clients():
+            if c.is_connected() and c != client:
+                if hasattr(c, '_me') and c._me and c._me.id in fallback_ids:
+                    clients_pool.append(c)
 
         # 2. Pre-download media if needed (so we don't have to download multiple times during failover)
         has_media = any(m.media for m in messages)
@@ -2509,8 +2536,8 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                     except errors.FloodWaitError as fwe:
                         logger.warning(f"⏳ MIRROR FLOOD: Client {getattr(active_client._me, 'username', 'unknown')} hit rate limit. Waiting {fwe.seconds}s...")
                         last_error = fwe
-                        # If failover is enabled and we have other clients, try the next client instead of sleeping here
-                        if get_setting("failover_on_ratelimit") == "1" and active_client != clients_pool[-1]:
+                        # If we have other clients, try the next client instead of sleeping here
+                        if active_client != clients_pool[-1]:
                             logger.info("🔄 FAILOVER: Trying next userbot in pool immediately.")
                             break
                         else:
@@ -5746,19 +5773,46 @@ def handle_callbacks(call):
             status_emoji = "🟢 Online" if is_connected else "🔴 Inactive/Offline" if not is_active else "🟡 Connected but Stopped"
             markup.add(InlineKeyboardButton(f"👤 {first_name} (@{username or 'No Username'}) - {status_emoji}", callback_data=f"userbot_view_{u_id}"))
             
-        failover = get_setting("failover_on_ratelimit") == "1"
-        failover_label = "🔄 Failover on Rate Limit: ENABLED" if failover else "🔄 Failover on Rate Limit: DISABLED"
-        markup.add(InlineKeyboardButton(failover_label, callback_data="toggle_failover_ratelimit"))
+        markup.add(InlineKeyboardButton("⚙️ Select Fallback Userbots", callback_data="fallback_userbots_menu"))
         
         markup.add(InlineKeyboardButton("🔌 Connect New Userbot", callback_data="user_connect_start"))
         markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
-    elif data == "toggle_failover_ratelimit":
-        failover = get_setting("failover_on_ratelimit") == "1"
-        set_setting("failover_on_ratelimit", "0" if failover else "1")
-        bot.answer_callback_query(call.id, f"Failover {'Disabled' if failover else 'Enabled'}")
-        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "userbots_main", 'message': call.message, 'id': call.id}))
+    elif data == "fallback_userbots_menu":
+        bot.answer_callback_query(call.id)
+        sessions = get_userbot_sessions()
+        fallback_str = get_setting("fallback_userbot_ids") or ""
+        fallback_ids = [int(x) for x in fallback_str.split(",") if x.strip()]
+        
+        text = "⚙️ *Select Fallback Userbots*\n\n"
+        text += "Choose which userbots you want to use as fallback/failover accounts when a rate limit is hit:\n\n"
+        
+        markup = InlineKeyboardMarkup(row_width=1)
+        for s in sessions:
+            db_id, phone, api_id, api_hash, session_string, u_id, username, first_name, is_active = s
+            selected = u_id in fallback_ids
+            indicator = "✅" if selected else "❌"
+            markup.add(InlineKeyboardButton(f"{indicator} {first_name} (@{username or 'No Username'})", callback_data=f"fallback_userbot_toggle_{u_id}"))
+            
+        markup.add(InlineKeyboardButton("🔙 Back to Userbots", callback_data="userbots_main"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("fallback_userbot_toggle_"):
+        target_uid = int(data.split("_")[-1])
+        fallback_str = get_setting("fallback_userbot_ids") or ""
+        fallback_ids = [int(x) for x in fallback_str.split(",") if x.strip()]
+        
+        if target_uid in fallback_ids:
+            fallback_ids.remove(target_uid)
+            msg_text = "Removed from fallback list."
+        else:
+            fallback_ids.append(target_uid)
+            msg_text = "Added to fallback list."
+            
+        set_setting("fallback_userbot_ids", ",".join(str(x) for x in fallback_ids))
+        bot.answer_callback_query(call.id, msg_text)
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "fallback_userbots_menu", 'message': call.message, 'id': call.id}))
 
     elif data.startswith("userbot_view_"):
         bot.answer_callback_query(call.id)
