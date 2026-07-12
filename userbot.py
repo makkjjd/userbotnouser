@@ -2803,6 +2803,7 @@ async def media_queue_worker():
                 sent = None
                 last_err = Exception("No clients available to send")
                 
+                resolved_files = []
                 for active_client in clients_pool:
                     client_name = getattr(active_client._me, 'first_name', 'Unknown')
                     logger.info(f"⏰ Queue Worker: Attempting send using client {client_name}...")
@@ -2813,9 +2814,37 @@ async def media_queue_worker():
                         last_err = te
                         continue
                     
+                    # Self-healing download logic for missing local files
+                    resolved_files = []
+                    for f_path, msg_id in zip(files, [it[3] for it in batch]):
+                        if f_path:
+                            if os.path.exists(f_path):
+                                resolved_files.append(f_path)
+                            else:
+                                logger.warning(f"⏰ Queue Worker: File {f_path} not found. Attempting to re-download message {msg_id} from {sid}...")
+                                try:
+                                    msg = await active_client.get_messages(int(sid), ids=int(msg_id))
+                                    if msg and msg.media:
+                                        async with media_semaphore:
+                                            new_path = await active_client.download_media(msg)
+                                        if new_path and os.path.exists(new_path):
+                                            resolved_files.append(new_path)
+                                            # Update database so we don't have to download again
+                                            with db_conn() as conn:
+                                                c = conn.cursor()
+                                                if USING_POSTGRES:
+                                                    c.execute("UPDATE pending_media_queue SET media_file_path = %s WHERE source_msg_id = %s AND source_chat_id = %s", (new_path, msg_id, sid))
+                                                else:
+                                                    c.execute("UPDATE pending_media_queue SET media_file_path = ? WHERE source_msg_id = ? AND source_chat_id = ?", (new_path, msg_id, sid))
+                                except Exception as re_err:
+                                    logger.error(f"⏰ Queue Worker: Failed to re-download media: {re_err}")
+                        else:
+                            resolved_files.append(None)
+                    
                     try:
-                        if files:
-                            file_payload = files if len(files) > 1 else files[0]
+                        active_files = [f for f in resolved_files if f]
+                        if active_files:
+                            file_payload = active_files if len(active_files) > 1 else active_files[0]
                             async with media_semaphore:
                                 sent = await active_client.send_message(
                                     entity=target_entity,
@@ -2824,6 +2853,11 @@ async def media_queue_worker():
                                     reply_to=reply_header
                                 )
                         else:
+                            if files:
+                                logger.error(f"⏰ Queue Worker: Skipping send using client {client_name} because all files failed to resolve/re-download.")
+                                last_err = Exception("All files failed to resolve/re-download")
+                                continue
+                                
                             sent = await active_client.send_message(
                                 entity=target_entity,
                                 message=album_text,
@@ -2852,6 +2886,7 @@ async def media_queue_worker():
                             break
                 
                 if sent:
+                    active_files = [f for f in resolved_files if f]
                     # Send to vault bot if configured using the client that successfully sent it
                     for token, username, bot_id in get_log_bots():
                         metadata = f"SID: {sid} | MID: {first_item[3]}\n"
@@ -2859,7 +2894,7 @@ async def media_queue_worker():
                         try:
                             await active_client.send_message(
                                 entity=int(bot_id),
-                                file=files if len(files) > 1 else (files[0] if files else None),
+                                file=active_files if len(active_files) > 1 else (active_files[0] if active_files else None),
                                 message=caption_text
                             )
                         except Exception as ve:
@@ -2874,8 +2909,9 @@ async def media_queue_worker():
                             else:
                                 c.execute("DELETE FROM pending_media_queue WHERE id = ?", (q_id,))
                                 
-                    # Delete local files to free space
-                    for f_path in files:
+                    # Delete local files (both original and newly downloaded) to free space
+                    all_paths_to_delete = set(files + active_files)
+                    for f_path in all_paths_to_delete:
                         if f_path and os.path.exists(f_path):
                             try:
                                 os.remove(f_path)
