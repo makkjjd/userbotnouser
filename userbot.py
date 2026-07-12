@@ -2324,258 +2324,282 @@ def update_telethon_entity_cache(client, peer):
         logger.error(f"Failed to update client._mb_entity_cache: {e}")
 
 async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, sid, pre_downloaded=None):
-    """Unified Hub for mirrored sending with native Forum Topic support."""
+    """Unified Hub for mirrored sending with native Forum Topic support and Client Failover."""
     downloaded_files = []
     try:
         if not messages: return
         first_msg = messages[0]
-        dest_topic_id = default_t_topic
         
-        # 0. Resolve Target Chat Entity (Anti PeerIdInvalid / Invalid Peer Error)
-        try:
-            target_entity = await resolve_target_id(client, tid)
-        except Exception as e:
-            logger.error(f"Failed to resolve target ID {tid}: {e}")
-            target_entity = int(tid)
+        # 1. Build Client Pool for Failover
+        clients_pool = [client]
+        if get_setting("failover_on_ratelimit") == "1":
+            for c in userbot_fleet_manager.get_all_clients():
+                if c.is_connected() and c != client:
+                    if hasattr(c, '_me') and c._me:
+                        clients_pool.append(c)
 
-        # 1. Resolve Topic Mapping
-        if is_mir:
-            source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
-            if not source_top and getattr(first_msg, 'forum_topic', False):
-                source_top = first_msg.id
-            if not source_top and first_msg.reply_to_msg_id:
-                source_top = first_msg.reply_to_msg_id
-            if source_top:
-                forum = getattr(first_msg.reply_to, "forum_topic", None)
-                src_title = getattr(forum, "title", None)
-                src_icon = None
-                if not src_title:
-                    try:
-                        resolved_sid = await resolve_target_id(client, sid)
-                        res = await client(functions.messages.GetForumTopicsRequest(
-                            peer=resolved_sid,
-                            offset_date=0,
-                            offset_id=0,
-                            offset_topic=0,
-                            limit=100
-                        ))
-                        for t in res.topics:
-                            if t.id == source_top:
-                                src_title = t.title
-                                src_icon = getattr(t, "icon_emoji_id", None)
-                                break
-                    except Exception: pass
-                
-                if src_title:
-                    logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
-                    dest_topic_id = await get_or_create_target_topic(client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
-                else:
-                    logger.warning(f"MIRROR: Could not resolve title for source topic {source_top}")
-
-        # 2. Check if Target is a Forum
-        is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
-
-        # 3. Resolve Reply Header
-        reply_header = None
-        if is_forum:
-            reply_header = int(dest_topic_id) if dest_topic_id else None
-            
-            top_msg_id = None
-            if first_msg.reply_to:
-                top_msg_id = getattr(first_msg.reply_to, 'reply_to_top_id', None)
-                if not top_msg_id and first_msg.reply_to.reply_to_msg_id:
-                    top_msg_id = first_msg.reply_to.reply_to_msg_id
-            
-            if top_msg_id:
-                mapped_top = get_message_mapping(sid, top_msg_id, tid)
-                if mapped_top:
-                    reply_header = int(mapped_top)
-            
-            # If replying to a specific message inside the topic, use mapped ID
-            if first_msg.reply_to_msg_id and (not top_msg_id or first_msg.reply_to_msg_id != top_msg_id):
-                mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped:
-                    reply_header = int(mapped)
-        else:
-            # Normal Group: Use Message Mapping for Replies
-            if first_msg.reply_to_msg_id:
-                mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
-                if mapped:
-                    reply_header = int(mapped)
-
-        # 4. Send Content
-        album_text = next((msg.message for msg in messages if msg.message), "")
-        sent = None
-        
-        # Determine the file/media to send
-        files_to_send = []
+        # 2. Pre-download media if needed (so we don't have to download multiple times during failover)
+        has_media = any(m.media for m in messages)
+        downloaded_paths = {}
         if pre_downloaded:
             if isinstance(pre_downloaded, dict):
-                for m in messages:
-                    if m.media:
-                        if m.id in pre_downloaded:
-                            files_to_send.append(pre_downloaded[m.id])
-                        else:
-                            files_to_send.append(m.media)
+                downloaded_paths = pre_downloaded
             elif isinstance(pre_downloaded, list):
                 media_msgs = [m for m in messages if m.media]
                 for idx, m in enumerate(media_msgs):
                     if idx < len(pre_downloaded):
-                        files_to_send.append(pre_downloaded[idx])
-                    else:
-                        files_to_send.append(m.media)
-        else:
-            files_to_send = [m.media for m in messages if m.media]
-            
-        file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
+                        downloaded_paths[m.id] = pre_downloaded[idx]
         
-        # Prevent 'The message cannot be empty unless a file is provided' exception
-        if not album_text.strip() and not file_to_send:
-            logger.warning(f"⚠️ MIRROR: Skipping message {first_msg.id} because it has no text content and no media/file.")
-            return
-
-        for attempt in range(3):
-            try:
-                # Attempt native forward first if not restricted/pre-downloaded to preserve the forward tag
-                if not pre_downloaded and not downloaded_files:
-                    try:
-                        import random
-                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
-                        top_msg_id_val = int(reply_header) if (is_forum and reply_header) else None
-                        
-                        sent_fwd = await client(functions.messages.ForwardMessagesRequest(
-                            from_peer=await client.get_input_entity(int(sid)),
-                            id=[msg.id for msg in messages],
-                            to_peer=target_entity,
-                            random_id=random_ids,
-                            top_msg_id=top_msg_id_val
-                        ))
-                        if sent_fwd:
-                            fwd_msgs = []
-                            if hasattr(sent_fwd, 'updates'):
-                                for u in sent_fwd.updates:
-                                    if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
-                                        fwd_msgs.append(u.message)
-                            if fwd_msgs:
-                                first_id = fwd_msgs[0].id
-                                sent = fwd_msgs if len(fwd_msgs) > 1 else fwd_msgs[0]
-                                logger.info(f"✅ MIRROR: Sent via native ForwardMessagesRequest to {tid} -> MSG ID: {first_id}")
-                                save_message_mapping(sid, first_msg.id, tid, first_id)
-                                break
-                    except Exception as fwd_err:
-                        logger.warning(f"Native forward in mirror failed: {fwd_err}. Trying send_message copy fallback...")
-
-                # Fallback to copy/re-upload system
-                if not sent:
-                    if file_to_send:
-                        async with media_semaphore:
-                            sent = await client.send_message(
-                                entity=target_entity, 
-                                message=album_text, 
-                                file=file_to_send,
-                                reply_to=reply_header
-                            )
-                    else:
-                        sent = await client.send_message(
-                            entity=target_entity, 
-                            message=album_text, 
-                            file=file_to_send,
-                            reply_to=reply_header
-                        )
-                    if sent:
-                        first_id = sent[0].id if isinstance(sent, list) else sent.id
-                        logger.info(f"✅ MIRROR: Sent via send_message to {tid} -> MSG ID: {first_id}")
-                        save_message_mapping(sid, first_msg.id, tid, first_id)
-                        break # Success!
-            except errors.FloodWaitError as fwe:
-                logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
-                await notify_admin_flood_wait(client, "Mirroring Content", fwe.seconds)
-                await notify_admin_flood_wait(client, "Mirroring Content", fwe.seconds)
-                await asyncio.sleep(fwe.seconds)
-            except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
-                await asyncio.sleep(2)
-            except Exception as e:
-                # If the error is due to protected/restricted/invalid media, try downloading and uploading it
-                err_msg = str(e).lower()
-                is_protected_error = any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer", "empty", "invalid or you can't do that operation"])
-                
-                # Check if we should attempt download & upload fallback
-                if is_protected_error and not pre_downloaded and not downloaded_files and any(m.media for m in messages):
-                    logger.info(f"🛡️ MIRROR: Protected/empty media error detected ({e}). Attempting download & upload fallback...")
-                    for m in messages:
-                        if m.media:
-                            try:
-                                async with media_semaphore:
-                                    path = await client.download_media(m)
-                                if path:
-                                    downloaded_files.append(path)
-                            except Exception as de:
-                                logger.error(f"Mirror download fallback failed: {de}")
-                    
-                    if downloaded_files:
-                        file_to_send = downloaded_files if len(downloaded_files) > 1 else downloaded_files[0]
-                        # Retry sending immediately in this attempt using the local file
+        sent = None
+        last_error = Exception("No clients available to send")
+        
+        for active_client in clients_pool:
+            client_name = getattr(active_client._me, 'first_name', 'Unknown')
+            logger.info(f"🔄 Mirror attempt using client: {client_name} (@{getattr(active_client._me, 'username', 'unknown')})")
+            
+            # Download media if not already done and we need to upload
+            if has_media and not downloaded_paths:
+                for m in messages:
+                    if m.media:
                         try:
                             async with media_semaphore:
-                                sent = await client.send_message(
-                                    entity=target_entity,
-                                    message=album_text,
-                                    file=file_to_send,
+                                path = await active_client.download_media(m)
+                            if path:
+                                downloaded_paths[m.id] = path
+                                downloaded_files.append(path)
+                        except Exception as de:
+                            logger.error(f"Mirror download failed for client {client_name}: {de}")
+            
+            dest_topic_id = default_t_topic
+            try:
+                # 0. Resolve Target Chat Entity
+                try:
+                    target_entity = await resolve_target_id(active_client, tid)
+                except Exception as e:
+                    logger.error(f"Failed to resolve target ID {tid}: {e}")
+                    target_entity = int(tid)
+
+                # 1. Resolve Topic Mapping
+                if is_mir:
+                    source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
+                    if not source_top and getattr(first_msg, 'forum_topic', False):
+                        source_top = first_msg.id
+                    if not source_top and first_msg.reply_to_msg_id:
+                        source_top = first_msg.reply_to_msg_id
+                    if source_top:
+                        forum = getattr(first_msg.reply_to, "forum_topic", None)
+                        src_title = getattr(forum, "title", None)
+                        src_icon = None
+                        if not src_title:
+                            try:
+                                resolved_sid = await resolve_target_id(active_client, sid)
+                                res = await active_client(functions.messages.GetForumTopicsRequest(
+                                    peer=resolved_sid,
+                                    offset_date=0,
+                                    offset_id=0,
+                                    offset_topic=0,
+                                    limit=100
+                                ))
+                                for t in res.topics:
+                                    if t.id == source_top:
+                                        src_title = t.title
+                                        src_icon = getattr(t, "icon_emoji_id", None)
+                                        break
+                            except Exception: pass
+                        
+                        if src_title:
+                            logger.info(f"MIRROR: Resolved source topic title: '{src_title}' (Icon: {src_icon})")
+                            dest_topic_id = await get_or_create_target_topic(active_client, tid, src_title, sid, source_top, icon_emoji_id=src_icon)
+
+                # 2. Check if Target is a Forum
+                is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+
+                # 3. Resolve Reply Header
+                reply_header = None
+                if is_forum:
+                    reply_header = int(dest_topic_id) if dest_topic_id else None
+                    top_msg_id = None
+                    if first_msg.reply_to:
+                        top_msg_id = getattr(first_msg.reply_to, 'reply_to_top_id', None)
+                        if not top_msg_id and first_msg.reply_to.reply_to_msg_id:
+                            top_msg_id = first_msg.reply_to.reply_to_msg_id
+                    if top_msg_id:
+                        mapped_top = get_message_mapping(sid, top_msg_id, tid)
+                        if mapped_top:
+                            reply_header = int(mapped_top)
+                    if first_msg.reply_to_msg_id and (not top_msg_id or first_msg.reply_to_msg_id != top_msg_id):
+                        mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                        if mapped:
+                            reply_header = int(mapped)
+                else:
+                    if first_msg.reply_to_msg_id:
+                        mapped = get_message_mapping(sid, first_msg.reply_to_msg_id, tid)
+                        if mapped:
+                            reply_header = int(mapped)
+
+                # 4. Construct Album Text and Files List
+                album_text = next((msg.message for msg in messages if msg.message), "")
+                files_to_send = []
+                for msg in messages:
+                    if msg.media:
+                        local_path = downloaded_paths.get(msg.id)
+                        if local_path and os.path.exists(local_path):
+                            files_to_send.append(local_path)
+                        else:
+                            files_to_send.append(msg.media)
+                
+                file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
+                
+                if not album_text.strip() and not file_to_send:
+                    logger.warning(f"⚠️ MIRROR: Skipping message {first_msg.id} because it has no text content and no media/file.")
+                    return
+
+                for attempt in range(3):
+                    try:
+                        # Attempt native forward first if not restricted/pre-downloaded to preserve the forward tag
+                        if not pre_downloaded and not downloaded_files:
+                            try:
+                                import random
+                                random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
+                                top_msg_id_val = int(reply_header) if (is_forum and reply_header) else None
+                                
+                                sent_fwd = await active_client(functions.messages.ForwardMessagesRequest(
+                                    from_peer=await active_client.get_input_entity(int(sid)),
+                                    id=[msg.id for msg in messages],
+                                    to_peer=target_entity,
+                                    random_id=random_ids,
+                                    top_msg_id=top_msg_id_val
+                                ))
+                                if sent_fwd:
+                                    fwd_msgs = []
+                                    if hasattr(sent_fwd, 'updates'):
+                                        for u in sent_fwd.updates:
+                                            if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
+                                                fwd_msgs.append(u.message)
+                                    if fwd_msgs:
+                                        first_id = fwd_msgs[0].id
+                                        sent = fwd_msgs if len(fwd_msgs) > 1 else fwd_msgs[0]
+                                        logger.info(f"✅ MIRROR: Sent via native ForwardMessagesRequest to {tid} -> MSG ID: {first_id}")
+                                        save_message_mapping(sid, first_msg.id, tid, first_id)
+                                        break
+                            except Exception as fwd_err:
+                                logger.warning(f"Native forward in mirror failed: {fwd_err}. Trying send_message copy fallback...")
+
+                        # Fallback to copy/re-upload system
+                        if not sent:
+                            if file_to_send:
+                                async with media_semaphore:
+                                    sent = await active_client.send_message(
+                                        entity=target_entity, 
+                                        message=album_text, 
+                                        file=file_to_send,
+                                        reply_to=reply_header
+                                    )
+                            else:
+                                sent = await active_client.send_message(
+                                    entity=target_entity, 
+                                    message=album_text, 
                                     reply_to=reply_header
                                 )
                             if sent:
                                 first_id = sent[0].id if isinstance(sent, list) else sent.id
-                                logger.info(f"✅ MIRROR: Sent via fallback to {tid} -> MSG ID: {first_id}")
+                                logger.info(f"✅ MIRROR: Sent via send_message to {tid} -> MSG ID: {first_id}")
                                 save_message_mapping(sid, first_msg.id, tid, first_id)
-                                break
-                        except Exception as fe:
-                            e = fe
-                
-                # If still not sent, attempt reply fallbacks/downgrades
-                if not sent:
-                    if reply_header is not None:
-                        next_reply_header = None
-                        if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
-                            next_reply_header = int(dest_topic_id)
-                        
-                        logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
-                        try:
-                            sent = await client.send_message(
-                                entity=target_entity, 
-                                message=album_text, 
-                                file=file_to_send,
-                                reply_to=next_reply_header
-                            )
-                            if sent:
-                                first_id = sent[0].id if isinstance(sent, list) else sent.id
-                                logger.info(f"✅ MIRROR: Sent after reply downgrade to {tid} -> MSG ID: {first_id}")
-                                save_message_mapping(sid, first_msg.id, tid, first_id)
-                                break
-                        except Exception as e2:
-                            if next_reply_header is not None:
-                                logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
+                                break # Success!
+                    except errors.FloodWaitError as fwe:
+                        logger.warning(f"⏳ MIRROR FLOOD: Client {getattr(active_client._me, 'username', 'unknown')} hit rate limit. Waiting {fwe.seconds}s...")
+                        last_error = fwe
+                        # If failover is enabled and we have other clients, try the next client instead of sleeping here
+                        if get_setting("failover_on_ratelimit") == "1" and active_client != clients_pool[-1]:
+                            logger.info("🔄 FAILOVER: Trying next userbot in pool immediately.")
+                            break
+                        else:
+                            await notify_admin_flood_wait(active_client, "Mirroring Content", fwe.seconds)
+                            await asyncio.sleep(fwe.seconds)
+                    except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        # Fallback download & upload
+                        err_msg = str(e).lower()
+                        is_protected_error = any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer", "empty", "invalid or you can't do that operation"])
+                        if is_protected_error and not pre_downloaded and not downloaded_files and any(m.media for m in messages):
+                            logger.info(f"🛡️ MIRROR: Protected/empty media error detected ({e}). Attempting download & upload fallback...")
+                            for m in messages:
+                                if m.media:
+                                    try:
+                                        async with media_semaphore:
+                                            path = await active_client.download_media(m)
+                                        if path:
+                                            downloaded_paths[m.id] = path
+                                            downloaded_files.append(path)
+                                    except Exception as de:
+                                        logger.error(f"Mirror download fallback failed: {de}")
+                            if downloaded_files:
+                                file_to_send = downloaded_files if len(downloaded_files) > 1 else downloaded_files[0]
                                 try:
-                                    sent = await client.send_message(
+                                    async with media_semaphore:
+                                        sent = await active_client.send_message(
+                                            entity=target_entity,
+                                            message=album_text,
+                                            file=file_to_send,
+                                            reply_to=reply_header
+                                        )
+                                    if sent:
+                                        first_id = sent[0].id if isinstance(sent, list) else sent.id
+                                        logger.info(f"✅ MIRROR: Sent via fallback to {tid} -> MSG ID: {first_id}")
+                                        save_message_mapping(sid, first_msg.id, tid, first_id)
+                                        break
+                                except Exception as fe:
+                                    e = fe
+                        
+                        if not sent:
+                            if reply_header is not None:
+                                next_reply_header = None
+                                if is_forum and dest_topic_id and reply_header != int(dest_topic_id):
+                                    next_reply_header = int(dest_topic_id)
+                                logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={reply_header} ({e}). Retrying with reply_to={next_reply_header}...")
+                                try:
+                                    sent = await active_client.send_message(
                                         entity=target_entity, 
                                         message=album_text, 
                                         file=file_to_send,
-                                        reply_to=None
+                                        reply_to=next_reply_header
                                     )
                                     if sent:
                                         first_id = sent[0].id if isinstance(sent, list) else sent.id
-                                        logger.info(f"✅ MIRROR: Sent after final reply clear to {tid} -> MSG ID: {first_id}")
+                                        logger.info(f"✅ MIRROR: Sent after reply downgrade to {tid} -> MSG ID: {first_id}")
                                         save_message_mapping(sid, first_msg.id, tid, first_id)
                                         break
-                                except Exception as e3:
-                                    e = e3
-                            else:
-                                e = e2
-                
-                logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
-                if attempt == 2: # Last attempt
-                    logger.error(f"❌ MIRROR: Final failure for message {first_msg.id}")
-                    raise e
-                    
+                                except Exception as e2:
+                                    if next_reply_header is not None:
+                                        logger.warning(f"⚠️ MIRROR: Failed to send with reply_to={next_reply_header} ({e2}). Retrying with reply_to=None...")
+                                        try:
+                                            sent = await active_client.send_message(
+                                                entity=target_entity, 
+                                                message=album_text, 
+                                                file=file_to_send,
+                                                reply_to=None
+                                            )
+                                            if sent:
+                                                first_id = sent[0].id if isinstance(sent, list) else sent.id
+                                                logger.info(f"✅ MIRROR: Sent after final reply clear to {tid} -> MSG ID: {first_id}")
+                                                save_message_mapping(sid, first_msg.id, tid, first_id)
+                                                break
+                                        except Exception as e3:
+                                            e = e3
+                                    else:
+                                        e = e2
+                        logger.error(f"MIRROR SEND ATTEMPT {attempt+1} FAILED: {e}")
+                        last_error = e
+                        if attempt == 2:
+                            raise e
+                if sent:
+                    break
+            except Exception as outer_e:
+                logger.error(f"Outer active_client error: {outer_e}")
+                last_error = outer_e
+        if not sent:
+            raise last_error
     except Exception as e:
         logger.error(f"Global Mirror Error: {e}")
         raise e
@@ -5722,9 +5746,19 @@ def handle_callbacks(call):
             status_emoji = "🟢 Online" if is_connected else "🔴 Inactive/Offline" if not is_active else "🟡 Connected but Stopped"
             markup.add(InlineKeyboardButton(f"👤 {first_name} (@{username or 'No Username'}) - {status_emoji}", callback_data=f"userbot_view_{u_id}"))
             
+        failover = get_setting("failover_on_ratelimit") == "1"
+        failover_label = "🔄 Failover on Rate Limit: ENABLED" if failover else "🔄 Failover on Rate Limit: DISABLED"
+        markup.add(InlineKeyboardButton(failover_label, callback_data="toggle_failover_ratelimit"))
+        
         markup.add(InlineKeyboardButton("🔌 Connect New Userbot", callback_data="user_connect_start"))
         markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data == "toggle_failover_ratelimit":
+        failover = get_setting("failover_on_ratelimit") == "1"
+        set_setting("failover_on_ratelimit", "0" if failover else "1")
+        bot.answer_callback_query(call.id, f"Failover {'Disabled' if failover else 'Enabled'}")
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "userbots_main", 'message': call.message, 'id': call.id}))
 
     elif data.startswith("userbot_view_"):
         bot.answer_callback_query(call.id)
