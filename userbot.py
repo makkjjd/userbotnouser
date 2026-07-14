@@ -119,6 +119,9 @@ media_semaphore = asyncio.Semaphore(2) # Limit concurrent download/upload operat
 processed_messages = set()
 processed_messages_queue = deque(maxlen=2000)
 
+# Link spam history tracker
+link_spam_history = {}
+
 def is_message_processed(chat_id, msg_id):
     try:
         with db_conn() as conn:
@@ -2515,13 +2518,34 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         # Fallback to copy/re-upload system
                         if not sent:
                             if file_to_send:
+                                is_sticker = any(get_specific_media_type(m.media) == "sticker" for m in messages)
                                 async with media_semaphore:
-                                    sent = await active_client.send_message(
-                                        entity=target_entity, 
-                                        message=album_text, 
-                                        file=file_to_send,
-                                        reply_to=reply_header
-                                    )
+                                    if is_sticker:
+                                        if isinstance(file_to_send, list):
+                                            sent_list = []
+                                            for f in file_to_send:
+                                                s_msg = await active_client.send_file(
+                                                    entity=target_entity,
+                                                    file=f,
+                                                    reply_to=reply_header,
+                                                    as_sticker=True
+                                                )
+                                                sent_list.append(s_msg)
+                                            sent = sent_list
+                                        else:
+                                            sent = await active_client.send_file(
+                                                entity=target_entity,
+                                                file=file_to_send,
+                                                reply_to=reply_header,
+                                                as_sticker=True
+                                            )
+                                    else:
+                                        sent = await active_client.send_message(
+                                            entity=target_entity, 
+                                            message=album_text, 
+                                            file=file_to_send,
+                                            reply_to=reply_header
+                                        )
                             else:
                                 sent = await active_client.send_message(
                                     entity=target_entity, 
@@ -2675,6 +2699,8 @@ def get_specific_media_type(media):
                     return "video"
                 if attr_name == "DocumentAttributeAudio":
                     return "file"
+                if attr_name == "DocumentAttributeSticker":
+                    return "sticker"
         return "file"
     return "file"
 
@@ -2846,13 +2872,35 @@ async def media_queue_worker():
                         active_files = [f for f in resolved_files if f]
                         if active_files:
                             file_payload = active_files if len(active_files) > 1 else active_files[0]
+                            first_f = active_files[0]
+                            is_sticker = first_f and (first_f.endswith('.webp') or first_f.endswith('.tgs'))
                             async with media_semaphore:
-                                sent = await active_client.send_message(
-                                    entity=target_entity,
-                                    message=album_text,
-                                    file=file_payload,
-                                    reply_to=reply_header
-                                )
+                                if is_sticker:
+                                    if isinstance(file_payload, list):
+                                        sent_list = []
+                                        for f in file_payload:
+                                            s_msg = await active_client.send_file(
+                                                entity=target_entity,
+                                                file=f,
+                                                reply_to=reply_header,
+                                                as_sticker=True
+                                            )
+                                            sent_list.append(s_msg)
+                                        sent = sent_list
+                                    else:
+                                        sent = await active_client.send_file(
+                                            entity=target_entity,
+                                            file=file_payload,
+                                            reply_to=reply_header,
+                                            as_sticker=True
+                                        )
+                                else:
+                                    sent = await active_client.send_message(
+                                        entity=target_entity,
+                                        message=album_text,
+                                        file=file_payload,
+                                        reply_to=reply_header
+                                    )
                         else:
                             if files:
                                 logger.error(f"⏰ Queue Worker: Skipping send using client {client_name} because all files failed to resolve/re-download.")
@@ -4305,6 +4353,52 @@ def setup_automation_handlers(client: TelegramClient):
             logger.info(f"🚫 BLOCKED: Ignored message from banned user {sender_id} (@{sender_username})")
             return
 
+        # --- LINK SPAM CHECK ---
+        if m.text and not event.is_private:
+            urls = []
+            if m.entities:
+                for ent in m.entities:
+                    ent_type = type(ent).__name__
+                    if ent_type == "MessageEntityUrl":
+                        urls.append(m.text[ent.offset:ent.offset+ent.length].strip())
+                    elif ent_type == "MessageEntityTextUrl":
+                        urls.append(ent.url.strip())
+            
+            if urls:
+                import time
+                now = time.time()
+                key = (m.chat_id, sender_id)
+                if key not in link_spam_history:
+                    link_spam_history[key] = []
+                
+                # Keep history for only the last 60 seconds
+                link_spam_history[key] = [item for item in link_spam_history[key] if now - item[1] < 60]
+                
+                for url in urls:
+                    link_spam_history[key].append((url, now))
+                    same_url_count = sum(1 for item in link_spam_history[key] if item[0] == url)
+                    if same_url_count >= 3:
+                        ban_user(user_id=sender_id, username=sender_username)
+                        logger.warning(f"🚫 AUTO-BAN: Banned user {sender_id} (@{sender_username}) for spamming link: {url}")
+                        
+                        admin_alert = (
+                            f"🚫 **Auto-Ban Alert (Link Spam)**\n\n"
+                            f"👤 **User:** `{sender_id}`" + (f" (@{sender_username})" if sender_username else "") + "\n"
+                            f"💬 **Group:** `{m.chat_id}`\n"
+                            f"🔗 **Spam Link:** {url}\n\n"
+                            f"**Action:** The user has been automatically **Banned/Blocked** from the bot."
+                        )
+                        try:
+                            bot.send_message(ADMIN_ID, admin_alert, parse_mode="Markdown")
+                        except Exception as notify_err:
+                            logger.error(f"Failed to notify admin of link spam auto-ban: {notify_err}")
+                            try:
+                                admin_entity = await client.get_entity(ADMIN_ID)
+                                await client.send_message(admin_entity, admin_alert)
+                            except Exception:
+                                pass
+                        return
+
         # --- ALBUM / SINGLE MESSAGE SPLIT ---
         if m.grouped_id:
             if m.grouped_id not in album_cache:
@@ -4436,18 +4530,83 @@ def cmd_tasks(message):
 def cmd_ban_user(message):
     if message.from_user.id != ADMIN_ID: return
     try:
+        target_uid = None
+        target_uname = None
         args = message.text.split()
-        if len(args) < 2:
-            bot.reply_to(message, "💡 *Usage:* `/ban` or `/block [username_or_id]`", parse_mode="Markdown")
+        
+        # 1. Check if replying to a message
+        if message.reply_to_message:
+            rep_msg = message.reply_to_message
+            target_msg_id = rep_msg.message_id
+            target_chat_id = rep_msg.chat.id
+            
+            # Query message mapping to find source chat and source msg
+            source_info = None
+            with db_conn() as conn:
+                c = conn.cursor()
+                p = get_placeholder()
+                clean_target_chat = str(target_chat_id).replace("-100", "")
+                c.execute(
+                    f"SELECT source_chat_id, source_msg_id FROM message_mappings "
+                    f"WHERE (target_chat_id = {p} OR target_chat_id = {p} OR target_chat_id = {p}) AND target_msg_id = {p}",
+                    (target_chat_id, int(clean_target_chat), -int(clean_target_chat), target_msg_id)
+                )
+                source_info = c.fetchone()
+                
+            if source_info:
+                # We have mapped source info, fetch via userbot to locate original sender
+                async def resolve_and_ban():
+                    try:
+                        active_client = next((c for c in userbot_fleet_manager.get_all_clients() if c.is_connected()), None)
+                        if active_client:
+                            src_chat = await resolve_target_id(active_client, source_info[0])
+                            msg = await active_client.get_messages(src_chat, ids=int(source_info[1]))
+                            if msg:
+                                sender_id = msg.sender_id
+                                sender_username = getattr(msg.sender, 'username', None)
+                                if sender_id:
+                                    ban_user(user_id=sender_id, username=sender_username)
+                                    target_str = f"`{sender_id}`" + (f" (@{sender_username})" if sender_username else "")
+                                    bot.reply_to(message, f"✅ *User Banned:* {target_str}\nTheir messages will no longer be processed.", parse_mode="Markdown")
+                                    return
+                        bot.reply_to(message, "❌ Failed to locate original sender (no active userbot clients).")
+                    except Exception as err:
+                        logger.error(f"Failed to resolve original sender for ban reply: {err}")
+                        bot.reply_to(message, f"❌ Ban Resolution Error: {err}")
+                
+                asyncio.run_coroutine_threadsafe(resolve_and_ban(), loop)
+                return
+
+            # If not mapped, try parsing the text of the replied message for user ID or username
+            import re
+            text_to_search = (rep_msg.text or "") + (rep_msg.caption or "")
+            tg_user_match = re.search(r"tg://user\?id=(\d+)", text_to_search)
+            if tg_user_match:
+                target_uid = int(tg_user_match.group(1))
+            else:
+                id_match = re.search(r"(?:user_id|id|sender_id|sender|user)\D*(\d{7,15})", text_to_search, re.IGNORECASE)
+                if id_match:
+                    target_uid = int(id_match.group(1))
+            
+            username_match = re.search(r"@(\w{4,32})", text_to_search)
+            if username_match:
+                target_uname = username_match.group(1)
+
+        # 2. Otherwise parse command arguments
+        elif len(args) >= 2:
+            target = args[1].replace("@", "")
+            if target.isdigit():
+                target_uid = int(target)
+            else:
+                target_uname = target
+                
+        if not target_uid and not target_uname:
+            bot.reply_to(message, "💡 *Usage:* Reply to a message with `/ban` or use `/ban [username_or_id]`", parse_mode="Markdown")
             return
-        
-        target = args[1].replace("@", "")
-        uid, uname = None, None
-        if target.isdigit(): uid = int(target)
-        else: uname = target
-        
-        ban_user(user_id=uid, username=uname)
-        bot.reply_to(message, f"✅ *User Banned:* `{target}`\nTheir messages will no longer be processed.", parse_mode="Markdown")
+            
+        ban_user(user_id=target_uid, username=target_uname)
+        target_display = f"`{target_uid}`" if target_uid else f"@{target_uname}"
+        bot.reply_to(message, f"✅ *User Banned:* {target_display}\nTheir messages will no longer be processed.", parse_mode="Markdown")
     except Exception as e:
         bot.reply_to(message, f"❌ Ban Error: {e}")
 
